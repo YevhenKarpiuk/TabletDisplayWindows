@@ -4,8 +4,11 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 
+#include "DesktopCapture.h"
+#include "MediaFoundationH264Encoder.h"
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
+#include "video/VideoProcessing.h"
 
 #include <algorithm>
 #include <array>
@@ -31,6 +34,14 @@ namespace
     constexpr std::uint64_t kCapabilities = 0xFF;
     constexpr std::uint64_t kRequiredCapabilities = 0xE1;
     constexpr std::uint64_t kAvcProfiles = 0x0E;
+
+    enum class RunMode
+    {
+        Connect,
+        Synthetic,
+        EncoderDemo,
+        Desktop
+    };
 
     struct ProcessResult
     {
@@ -387,25 +398,28 @@ namespace
 
     [[nodiscard]] Message MakeVideoConfig(
         std::uint64_t sequence,
-        const tabletdisplay::video::SyntheticH264& stream)
+        std::uint16_t width,
+        std::uint16_t height,
+        std::uint16_t fps,
+        std::uint8_t profileIdc,
+        std::uint8_t levelIdc,
+        std::uint32_t bitrate,
+        std::span<const std::uint8_t> codecSpecificData)
     {
         std::vector<std::uint8_t> payload;
-        payload.reserve(28U + stream.codecSpecificData.size());
+        payload.reserve(28U + codecSpecificData.size());
         AppendLe(payload, static_cast<std::uint32_t>(1)); // stream_id.
         AppendLe(payload, static_cast<std::uint32_t>(1)); // config_id.
-        AppendLe(payload, stream.width);
-        AppendLe(payload, stream.height);
-        AppendLe(payload, stream.fps);
+        AppendLe(payload, width);
+        AppendLe(payload, height);
+        AppendLe(payload, fps);
         AppendLe(payload, static_cast<std::uint16_t>(1));
-        payload.push_back(stream.profileIdc);
-        payload.push_back(stream.levelIdc);
+        payload.push_back(profileIdc);
+        payload.push_back(levelIdc);
         AppendLe(payload, static_cast<std::uint16_t>(1)); // ANNEX_B_CSD.
-        AppendLe(payload, static_cast<std::uint32_t>(5'000'000));
-        AppendLe(payload, static_cast<std::uint32_t>(stream.codecSpecificData.size()));
-        payload.insert(
-            payload.end(),
-            stream.codecSpecificData.begin(),
-            stream.codecSpecificData.end());
+        AppendLe(payload, bitrate);
+        AppendLe(payload, static_cast<std::uint32_t>(codecSpecificData.size()));
+        payload.insert(payload.end(), codecSpecificData.begin(), codecSpecificData.end());
         return {
             { static_cast<std::uint16_t>(MessageType::VideoConfig), Critical,
               static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
@@ -415,23 +429,28 @@ namespace
 
     [[nodiscard]] Message MakeVideoFrame(
         std::uint64_t sequence,
-        const tabletdisplay::video::SyntheticH264& stream)
+        std::uint64_t frameId,
+        std::uint64_t presentationTimeUs,
+        std::span<const std::uint8_t> accessUnit,
+        bool keyFrame,
+        bool discontinuity,
+        bool endOfStream = false)
     {
         std::vector<std::uint8_t> payload;
-        payload.reserve(32U + stream.idrAccessUnit.size());
+        payload.reserve(32U + accessUnit.size());
         AppendLe(payload, static_cast<std::uint32_t>(1)); // stream_id.
         AppendLe(payload, static_cast<std::uint32_t>(1)); // config_id.
-        AppendLe(payload, static_cast<std::uint64_t>(1)); // frame_id.
-        AppendLe(payload, static_cast<std::uint64_t>(0)); // PTS relative to stream start.
-        AppendLe(payload, static_cast<std::uint32_t>(stream.idrAccessUnit.size()));
+        AppendLe(payload, frameId);
+        AppendLe(payload, presentationTimeUs);
+        AppendLe(payload, static_cast<std::uint32_t>(accessUnit.size()));
         AppendLe(payload, static_cast<std::uint32_t>(0));
-        payload.insert(
-            payload.end(),
-            stream.idrAccessUnit.begin(),
-            stream.idrAccessUnit.end());
+        payload.insert(payload.end(), accessUnit.begin(), accessUnit.end());
+        auto flags = static_cast<std::uint16_t>(Critical);
+        if (keyFrame) flags = static_cast<std::uint16_t>(flags | KeyFrame);
+        if (discontinuity) flags = static_cast<std::uint16_t>(flags | Discontinuity);
+        if (endOfStream) flags = static_cast<std::uint16_t>(flags | EndOfStream);
         return {
-            { static_cast<std::uint16_t>(MessageType::VideoFrame),
-              static_cast<std::uint16_t>(Critical | KeyFrame | Discontinuity),
+            { static_cast<std::uint16_t>(MessageType::VideoFrame), flags,
               static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
             std::move(payload)
         };
@@ -509,8 +528,11 @@ namespace
         std::cout
             << "Synthetic H.264: " << stream.width << 'x' << stream.height
             << ", IDR " << stream.idrAccessUnit.size() << " bytes\n";
-        SendMessage(socket, MakeVideoConfig(nextSequence++, stream));
-        SendMessage(socket, MakeVideoFrame(nextSequence++, stream));
+        SendMessage(socket, MakeVideoConfig(
+            nextSequence++, stream.width, stream.height, stream.fps,
+            stream.profileIdc, stream.levelIdc, 5'000'000, stream.codecSpecificData));
+        SendMessage(socket, MakeVideoFrame(
+            nextSequence++, 1, 0, stream.idrAccessUnit, true, true));
         std::cout << "Color bars sent; keeping the demo session alive for 6 seconds.\n";
         for (unsigned second = 0; second < 6; ++second)
         {
@@ -518,6 +540,165 @@ namespace
             SendMessage(socket, MakePing(nextSequence++, RandomNonce()));
         }
         std::cout << "Synthetic video demo completed.\n";
+    }
+
+    void RunEncoderDemo(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
+    {
+        constexpr std::uint16_t width = 1280;
+        constexpr std::uint16_t height = 800;
+        constexpr std::uint16_t fps = 30;
+        constexpr std::uint32_t bitrate = 5'000'000;
+        tabletdisplay::host::MediaFoundationH264Encoder encoder({
+            width, height, fps, bitrate, false });
+        std::cout << "Media Foundation encoder demo: " << encoder.Name() << '\n';
+
+        std::vector<std::uint8_t> nv12(
+            static_cast<std::size_t>(width) * height * 3U / 2U,
+            128);
+        std::uint64_t frameId = 1;
+        std::uint64_t bytesSent{};
+        bool configSent{};
+        bool firstFrame = true;
+        const auto sendEncoded = [&](const tabletdisplay::host::EncodedAccessUnit& encoded)
+        {
+            if (!configSent)
+            {
+                const auto* config = encoder.CodecConfig();
+                if (config == nullptr) throw std::runtime_error("H.264 encoder produced no SPS/PPS");
+                SendMessage(socket, MakeVideoConfig(
+                    nextSequence++, width, height, fps,
+                    config->profileIdc == 0 ? 66 : config->profileIdc,
+                    config->levelIdc == 0 ? 40 : config->levelIdc,
+                    bitrate,
+                    config->annexB));
+                configSent = true;
+            }
+            SendMessage(socket, MakeVideoFrame(
+                nextSequence++,
+                frameId++,
+                encoded.presentationTimeUs,
+                encoded.bytes,
+                encoded.keyFrame,
+                firstFrame));
+            bytesSent += encoded.bytes.size();
+            firstFrame = false;
+        };
+
+        const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
+        auto nextFrameTime = std::chrono::steady_clock::now();
+        const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
+        for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+        {
+            auto* yPlane = nv12.data();
+            for (std::uint32_t y = 0; y < height; ++y)
+            {
+                for (std::uint32_t x = 0; x < width; ++x)
+                {
+                    const auto band = ((x + frameIndex * 12U) / 160U) % 8U;
+                    yPlane[static_cast<std::size_t>(y) * width + x] =
+                        static_cast<std::uint8_t>(32U + band * 27U);
+                }
+            }
+            std::fill(
+                nv12.begin() + static_cast<std::size_t>(width) * height,
+                nv12.end(),
+                static_cast<std::uint8_t>(128));
+            for (const auto& encoded : encoder.Encode(
+                    nv12,
+                    frameIndex * 1'000'000ULL / fps,
+                    frameIndex == 0))
+                sendEncoded(encoded);
+            nextFrameTime += frameDuration;
+            std::this_thread::sleep_until(nextFrameTime);
+        }
+        for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
+        if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
+        SendMessage(socket, MakeVideoFrame(
+            nextSequence++,
+            frameId,
+            static_cast<std::uint64_t>(seconds) * 1'000'000ULL,
+            {},
+            false,
+            false,
+            true));
+        std::cout
+            << "Encoder demo completed: " << (frameId - 1) << " frames, "
+            << bytesSent << " encoded bytes.\n";
+    }
+
+    void RunDesktopStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
+    {
+        constexpr std::uint16_t width = 1280;
+        constexpr std::uint16_t height = 800;
+        constexpr std::uint16_t fps = 30;
+        constexpr std::uint32_t bitrate = 5'000'000;
+        tabletdisplay::host::DesktopCapture capture(width, height);
+        tabletdisplay::host::MediaFoundationH264Encoder encoder({
+            width, height, fps, bitrate, false });
+        std::cout
+            << "Desktop capture: primary display -> " << width << 'x' << height << " @ " << fps << " FPS\n"
+            << "Media Foundation encoder: " << encoder.Name()
+            << (encoder.IsHardware() ? " (hardware)" : " (software fallback)") << '\n';
+
+        const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
+        auto nextFrameTime = std::chrono::steady_clock::now();
+        std::uint64_t frameId = 1;
+        std::uint64_t bytesSent{};
+        bool configSent{};
+        bool firstFrame = true;
+
+        const auto sendEncoded = [&](const tabletdisplay::host::EncodedAccessUnit& encoded)
+        {
+            if (!configSent)
+            {
+                const auto* config = encoder.CodecConfig();
+                if (config == nullptr) throw std::runtime_error("H.264 encoder produced no SPS/PPS");
+                SendMessage(socket, MakeVideoConfig(
+                    nextSequence++, width, height, fps,
+                    config->profileIdc == 0 ? 66 : config->profileIdc,
+                    config->levelIdc == 0 ? 40 : config->levelIdc,
+                    bitrate,
+                    config->annexB));
+                configSent = true;
+            }
+            if (firstFrame && !encoded.keyFrame)
+                throw std::runtime_error("H.264 encoder did not produce an initial IDR");
+            SendMessage(socket, MakeVideoFrame(
+                nextSequence++,
+                frameId++,
+                encoded.presentationTimeUs,
+                encoded.bytes,
+                encoded.keyFrame,
+                firstFrame));
+            bytesSent += encoded.bytes.size();
+            firstFrame = false;
+        };
+
+        const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
+        for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+        {
+            std::this_thread::sleep_until(nextFrameTime);
+            const auto frame = capture.Capture();
+            const auto nv12 = tabletdisplay::video::BgraToNv12(
+                frame.bgra, frame.width, frame.height, frame.stride);
+            const auto ptsUs = frameIndex * 1'000'000ULL / fps;
+            for (const auto& encoded : encoder.Encode(nv12, ptsUs, frameIndex == 0))
+                sendEncoded(encoded);
+            nextFrameTime += frameDuration;
+        }
+        for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
+        if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
+        SendMessage(socket, MakeVideoFrame(
+            nextSequence++,
+            frameId,
+            static_cast<std::uint64_t>(seconds) * 1'000'000ULL,
+            {},
+            false,
+            false,
+            true));
+        std::cout
+            << "Desktop stream completed: " << (frameId - 1) << " frames, "
+            << bytesSent << " encoded bytes.\n";
     }
 
     void PrintHelp()
@@ -528,10 +709,15 @@ namespace
             << "  TabletDisplayHost --check\n"
             << "  TabletDisplayHost --connect [--serial SERIAL]\n"
             << "  TabletDisplayHost --demo [--serial SERIAL]\n"
+            << "  TabletDisplayHost --encoder-demo [--serial SERIAL] [--seconds N]\n"
+            << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --version\n";
     }
 
-    int ConnectCommand(const std::string& requestedSerial, bool runDemo)
+    int ConnectCommand(
+        const std::string& requestedSerial,
+        RunMode mode,
+        unsigned streamSeconds)
     {
         const auto adb = FindAdb();
         std::cout << "ADB: " << Narrow(adb.wstring()) << '\n';
@@ -556,9 +742,17 @@ namespace
             WinsockSession winsock;
             auto socket = ConnectLoopback();
             const auto nextSequence = PerformHandshake(socket.get());
-            if (runDemo)
+            if (mode == RunMode::Synthetic)
             {
                 RunSyntheticDemo(socket.get(), nextSequence);
+            }
+            else if (mode == RunMode::EncoderDemo)
+            {
+                RunEncoderDemo(socket.get(), nextSequence, streamSeconds);
+            }
+            else if (mode == RunMode::Desktop)
+            {
+                RunDesktopStream(socket.get(), nextSequence, streamSeconds);
             }
             if (createdForward)
             {
@@ -590,7 +784,7 @@ int main(int argc, char* argv[])
         }
         if (command == "--version")
         {
-            std::cout << "TabletDisplayHost 0.3.0\n";
+            std::cout << "TabletDisplayHost 0.4.0\n";
             return 0;
         }
         if (command == "--check")
@@ -601,12 +795,36 @@ int main(int argc, char* argv[])
                 << "ADB: " << Narrow(FindAdb().wstring()) << '\n';
             return 0;
         }
-        if (command == "--connect" || command == "--demo")
+        if (command == "--connect" || command == "--demo" ||
+            command == "--encoder-demo" || command == "--stream")
         {
             std::string serial;
-            if (argc == 4 && std::string_view(argv[2]) == "--serial") serial = argv[3];
-            else if (argc != 2) throw std::runtime_error("Expected command [--serial SERIAL]");
-            return ConnectCommand(serial, command == "--demo");
+            unsigned seconds = 10;
+            for (int index = 2; index < argc; ++index)
+            {
+                const std::string_view option = argv[index];
+                if (option == "--serial" && index + 1 < argc)
+                {
+                    serial = argv[++index];
+                }
+                else if (option == "--seconds" && index + 1 < argc &&
+                    (command == "--stream" || command == "--encoder-demo"))
+                {
+                    const auto parsed = std::stoul(argv[++index]);
+                    if (parsed == 0 || parsed > 3'600) throw std::runtime_error("--seconds must be in 1..3600");
+                    seconds = parsed;
+                }
+                else
+                {
+                    throw std::runtime_error("Expected [--serial SERIAL] [--seconds N]");
+                }
+            }
+            const auto mode = command == "--stream"
+                ? RunMode::Desktop
+                : (command == "--encoder-demo"
+                    ? RunMode::EncoderDemo
+                    : (command == "--demo" ? RunMode::Synthetic : RunMode::Connect));
+            return ConnectCommand(serial, mode, seconds);
         }
         throw std::runtime_error("Unknown argument");
     }

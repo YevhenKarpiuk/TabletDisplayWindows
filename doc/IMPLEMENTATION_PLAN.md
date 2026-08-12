@@ -1,6 +1,6 @@
 # План реализации TabletDisplayWindows
 
-> Статус 2026-08-12: окружение, protocol v1, ADB handshake и synthetic H.264 transport проверены сквозным тестом на планшете. Следующий основной шаг — test-sign/install IddCx и прототип Driver/Host IPC.
+> Статус 2026-08-12: кроме synthetic transport реализованы DXGI primary-desktop capture, BGRA→NV12 и low-latency Media Foundation H.264 sender. Сквозной MF-тест передал 150 кадров аппаратному Android decoder. Следующий шаг — test-sign/install IddCx и Driver/Host D3D11 IPC; CPU-capture пока использует software MFT.
 
 ## 1. Цель и границы MVP
 

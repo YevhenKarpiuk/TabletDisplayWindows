@@ -53,18 +53,24 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;d3d11.lib;dxgi.lib;mfplat.lib;mf.lib;mfuuid.lib;ole32.lib;propsys.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\DesktopCapture.cpp" />
+    <ClCompile Include="src\MediaFoundationH264Encoder.cpp" />
     <ClCompile Include="..\shared\protocol\Protocol.cpp" />
     <ClCompile Include="..\shared\video\SyntheticH264.cpp" />
+    <ClCompile Include="..\shared\video\VideoProcessing.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\DesktopCapture.h" />
+    <ClInclude Include="src\MediaFoundationH264Encoder.h" />
     <ClInclude Include="..\shared\protocol\Protocol.h" />
     <ClInclude Include="..\shared\protocol\ProtocolConstants.h" />
     <ClInclude Include="..\shared\video\SyntheticH264.h" />
+    <ClInclude Include="..\shared\video\VideoProcessing.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

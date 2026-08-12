@@ -1,5 +1,6 @@
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
+#include "video/VideoProcessing.h"
 
 #include <algorithm>
 #include <cctype>
@@ -289,7 +290,47 @@ int main(int argc, char* argv[])
         Check(synthetic.codecSpecificData[4] == 0x67, "synthetic SPS");
         Check(synthetic.idrAccessUnit[4] == 0x67, "synthetic access unit SPS");
 
-        std::cout << "TabletDisplay protocol: 13 golden vectors and synthetic H.264 passed\n";
+        const std::vector<std::uint8_t> blackBgra{
+            0, 0, 0, 255, 0, 0, 0, 255,
+            0, 0, 0, 255, 0, 0, 0, 255
+        };
+        const auto blackNv12 = tabletdisplay::video::BgraToNv12(blackBgra, 2, 2, 8);
+        Check(blackNv12 == std::vector<std::uint8_t>({ 16, 16, 16, 16, 128, 128 }),
+            "BGRA black to NV12");
+
+        const std::vector<std::uint8_t> whiteBgra{
+            255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 255, 255, 255, 255, 255, 255
+        };
+        const auto whiteNv12 = tabletdisplay::video::BgraToNv12(whiteBgra, 2, 2, 8);
+        Check(whiteNv12 == std::vector<std::uint8_t>({ 235, 235, 235, 235, 128, 128 }),
+            "BGRA white to NV12");
+
+        const std::vector<std::uint8_t> lengthPrefixed{
+            0, 0, 0, 2, 0x65, 0xAA,
+            0, 0, 0, 2, 0x41, 0xBB
+        };
+        const auto annexB = tabletdisplay::video::NormalizeH264AccessUnit(lengthPrefixed);
+        Check(annexB == std::vector<std::uint8_t>({
+            0, 0, 0, 1, 0x65, 0xAA,
+            0, 0, 0, 1, 0x41, 0xBB
+        }), "length-prefixed access unit to Annex B");
+        Check(tabletdisplay::video::AnnexBContainsNalType(annexB, 5), "Annex B IDR detection");
+
+        const std::vector<std::uint8_t> avcConfig{
+            1, 66, 0, 40, 0xFF, 0xE1,
+            0, 4, 0x67, 66, 0, 40,
+            1, 0, 2, 0x68, 0xCE
+        };
+        const auto parsedConfig = tabletdisplay::video::ParseH264CodecConfig(avcConfig);
+        Check(parsedConfig.profileIdc == 66 && parsedConfig.levelIdc == 40,
+            "AVC configuration profile/level");
+        Check(parsedConfig.nalLengthSize == 4, "AVC configuration NAL length");
+        Check(tabletdisplay::video::AnnexBContainsNalType(parsedConfig.annexB, 7) &&
+            tabletdisplay::video::AnnexBContainsNalType(parsedConfig.annexB, 8),
+            "AVC configuration SPS/PPS");
+
+        std::cout << "TabletDisplay protocol: 13 golden vectors, H.264 and pixel pipeline passed\n";
         return 0;
     }
     catch (const std::exception& exception)
