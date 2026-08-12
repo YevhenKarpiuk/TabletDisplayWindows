@@ -13,4 +13,4 @@ Windows-часть системы, превращающей Android-планше
 - Главный риск: надёжная и быстрая передача кадров из UMDF/IddCx в отдельный host-процесс; сначала нужен изолированный прототип IPC.
 - План: [doc/IMPLEMENTATION_PLAN.md](doc/IMPLEMENTATION_PLAN.md).
 
-Статус: каркас проверен в Debug/Release x64: IddCx-драйвер на базе Microsoft IddSample, C++20 host и portable-WDK build scripts собираются без ошибок. Потоковое видео, IPC и ввод ещё не реализованы.
+Статус: каркас проверен в Debug/Release x64. Wire-протокол v1 зафиксирован в `doc/PROTOCOL.md`; строгий incremental parser и общие golden-векторы находятся в `protocol/golden` и покрыты C++-тестами. Потоковое видео, IPC и ввод ещё не подключены.

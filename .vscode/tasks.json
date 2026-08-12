@@ -24,6 +24,13 @@
       "args": ["--check"],
       "dependsOn": "build: debug x64",
       "problemMatcher": []
+    },
+    {
+      "label": "test: protocol",
+      "type": "process",
+      "command": "${workspaceFolder}\\test.cmd",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": "$msCompile"
     }
   ]
 }
