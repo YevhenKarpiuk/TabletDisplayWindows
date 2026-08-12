@@ -1024,16 +1024,10 @@ NTSTATUS IddSampleMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_
     // monitor's descriptor and instead are based on the static processing capability of the device. The OS will
     // report the available set of modes for a given output as the intersection of monitor modes with target modes.
 
-    TargetModes.push_back(CreateIddCxTargetMode(3840, 2160, 60));
-    TargetModes.push_back(CreateIddCxTargetMode(2560, 1440, 144));
-    TargetModes.push_back(CreateIddCxTargetMode(2560, 1440, 90));
-    TargetModes.push_back(CreateIddCxTargetMode(2560, 1440, 60));
-    TargetModes.push_back(CreateIddCxTargetMode(1920, 1080, 144));
-    TargetModes.push_back(CreateIddCxTargetMode(1920, 1080, 90));
-    TargetModes.push_back(CreateIddCxTargetMode(1920, 1080, 60));
-    TargetModes.push_back(CreateIddCxTargetMode(1600,  900, 60));
-    TargetModes.push_back(CreateIddCxTargetMode(1024,  768, 75));
-    TargetModes.push_back(CreateIddCxTargetMode(1024,  768, 60));
+    TargetModes.push_back(CreateIddCxTargetMode(1920, 1200, 60));
+    TargetModes.push_back(CreateIddCxTargetMode(1920, 1200, 30));
+    TargetModes.push_back(CreateIddCxTargetMode(1280,  800, 60));
+    TargetModes.push_back(CreateIddCxTargetMode(1280,  800, 30));
 
     pOutArgs->TargetModeBufferOutputCount = (UINT) TargetModes.size();
 
