@@ -1,0 +1,12 @@
+.vs/
+.vscode/*.log
+packages/
+artifacts/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+*.binlog
+*.log
