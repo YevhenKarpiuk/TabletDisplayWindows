@@ -221,6 +221,24 @@ namespace tabletdisplay::host
             CheckHr(transform->ProcessMessage(
                 MFT_MESSAGE_SET_D3D_MANAGER,
                 reinterpret_cast<ULONG_PTR>(deviceManager.Get())), "MFT_MESSAGE_SET_D3D_MANAGER");
+
+            D3D11_TEXTURE2D_DESC description{};
+            description.Width = options.width;
+            description.Height = options.height;
+            description.MipLevels = 1;
+            description.ArraySize = 1;
+            description.Format = DXGI_FORMAT_NV12;
+            description.SampleDesc.Count = 1;
+            description.Usage = D3D11_USAGE_DEFAULT;
+            CheckHr(d3dDevice->CreateTexture2D(
+                &description, nullptr, &hardwareInputTexture),
+                "CreateTexture2D(reusable NV12 input)");
+            CheckHr(MFCreateDXGISurfaceBuffer(
+                __uuidof(ID3D11Texture2D),
+                hardwareInputTexture.Get(),
+                0,
+                FALSE,
+                &hardwareInputBuffer), "MFCreateDXGISurfaceBuffer(reusable input)");
         }
 
         void Configure()
@@ -324,27 +342,16 @@ namespace tabletdisplay::host
             ComPtr<IMFMediaBuffer> buffer;
             if (hardware)
             {
-                D3D11_TEXTURE2D_DESC description{};
-                description.Width = options.width;
-                description.Height = options.height;
-                description.MipLevels = 1;
-                description.ArraySize = 1;
-                description.Format = DXGI_FORMAT_NV12;
-                description.SampleDesc.Count = 1;
-                description.Usage = D3D11_USAGE_DEFAULT;
-                D3D11_SUBRESOURCE_DATA initial{};
-                initial.pSysMem = nv12.data();
-                initial.SysMemPitch = options.width;
-                initial.SysMemSlicePitch = static_cast<UINT>(nv12.size());
-                ComPtr<ID3D11Texture2D> texture;
-                CheckHr(d3dDevice->CreateTexture2D(&description, &initial, &texture),
-                    "CreateTexture2D(NV12 input)");
-                CheckHr(MFCreateDXGISurfaceBuffer(
-                    __uuidof(ID3D11Texture2D),
-                    texture.Get(),
+                if (!hardwareInputTexture || !hardwareInputBuffer)
+                    throw std::runtime_error("Reusable hardware input surface is not initialized");
+                d3dContext->UpdateSubresource(
+                    hardwareInputTexture.Get(),
                     0,
-                    FALSE,
-                    &buffer), "MFCreateDXGISurfaceBuffer(input)");
+                    nullptr,
+                    nv12.data(),
+                    options.width,
+                    static_cast<UINT>(nv12.size()));
+                buffer = hardwareInputBuffer;
             }
             else
             {
@@ -541,6 +548,8 @@ namespace tabletdisplay::host
         ComPtr<ID3D11Device> d3dDevice;
         ComPtr<ID3D11DeviceContext> d3dContext;
         ComPtr<IMFDXGIDeviceManager> deviceManager;
+        ComPtr<ID3D11Texture2D> hardwareInputTexture;
+        ComPtr<IMFMediaBuffer> hardwareInputBuffer;
         std::optional<tabletdisplay::video::H264CodecConfig> config;
         std::string name;
         DWORD inputId{};
