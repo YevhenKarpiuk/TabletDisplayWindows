@@ -14,11 +14,14 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <span>
@@ -26,6 +29,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace
@@ -806,57 +810,153 @@ namespace
         const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
         using Clock = std::chrono::steady_clock;
         const auto streamStarted = Clock::now();
-        auto nextFrameTime = streamStarted;
         const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
-        std::vector<std::uint8_t> nv12;
+
+        struct PreparedFrameSlot
+        {
+            std::mutex mutex;
+            std::condition_variable ready;
+            std::condition_variable empty;
+            std::vector<std::uint8_t> nv12;
+            bool occupied{};
+            bool finished{};
+            bool stop{};
+            std::exception_ptr failure;
+        } slot;
+
         std::chrono::nanoseconds captureTime{};
         std::chrono::nanoseconds conversionTime{};
         std::chrono::nanoseconds encodingTime{};
         std::chrono::nanoseconds sendTime{};
-        std::chrono::nanoseconds maximumFrameWork{};
+        std::chrono::nanoseconds maximumProducerWork{};
+        std::chrono::nanoseconds maximumConsumerWork{};
         std::uint64_t missedFrameDeadlines{};
-        for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+
+        std::thread producer([&]
         {
-            auto frameWorkStarted = Clock::now();
-            if (frameIndex != 0)
+            try
             {
-                nextFrameTime += frameDuration;
-                std::this_thread::sleep_until(nextFrameTime);
-                frameWorkStarted = Clock::now();
-                tabletdisplay::host::CapturedFrame latest{};
-                const auto captureStarted = Clock::now();
-                if (capture.Capture(latest, 0))
+                std::vector<std::uint8_t> prepared;
+                auto nextCaptureTime = streamStarted;
+                for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
                 {
-                    frame = latest;
-                    if (frame.width != width || frame.height != height)
                     {
-                        throw std::runtime_error(
-                            "The virtual display mode changed during streaming; restart virtual-stream.cmd");
+                        std::unique_lock lock(slot.mutex);
+                        slot.empty.wait(lock, [&] { return !slot.occupied || slot.stop; });
+                        if (slot.stop) return;
+                        prepared.swap(slot.nv12);
                     }
+
+                    if (frameIndex != 0)
+                    {
+                        nextCaptureTime += frameDuration;
+                        std::this_thread::sleep_until(nextCaptureTime);
+                    }
+
+                    const auto producerWorkStarted = Clock::now();
+                    if (frameIndex != 0)
+                    {
+                        tabletdisplay::host::CapturedFrame latest{};
+                        const auto captureStarted = Clock::now();
+                        if (capture.Capture(latest, 0))
+                        {
+                            frame = std::move(latest);
+                            if (frame.width != width || frame.height != height)
+                            {
+                                throw std::runtime_error(
+                                    "The virtual display mode changed during streaming; restart virtual-stream.cmd");
+                            }
+                        }
+                        captureTime += Clock::now() - captureStarted;
+                    }
+
+                    const auto conversionStarted = Clock::now();
+                    tabletdisplay::video::BgraToNv12(
+                        frame.bgra, frame.width, frame.height, frame.stride, prepared);
+                    conversionTime += Clock::now() - conversionStarted;
+                    maximumProducerWork = std::max(
+                        maximumProducerWork,
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            Clock::now() - producerWorkStarted));
+
+                    {
+                        std::lock_guard lock(slot.mutex);
+                        if (slot.stop) return;
+                        slot.nv12.swap(prepared);
+                        slot.occupied = true;
+                    }
+                    slot.ready.notify_one();
                 }
-                captureTime += Clock::now() - captureStarted;
+            }
+            catch (...)
+            {
+                std::lock_guard lock(slot.mutex);
+                slot.failure = std::current_exception();
             }
 
-            const auto conversionStarted = Clock::now();
-            tabletdisplay::video::BgraToNv12(
-                frame.bgra, frame.width, frame.height, frame.stride, nv12);
-            conversionTime += Clock::now() - conversionStarted;
-            const auto ptsUs = frameIndex * 1'000'000ULL / fps;
-            const auto encodingStarted = Clock::now();
-            const auto encodedFrames = encoder.Encode(nv12, ptsUs, frameIndex == 0);
-            encodingTime += Clock::now() - encodingStarted;
-            const auto sendStarted = Clock::now();
-            for (const auto& encoded : encodedFrames)
-                sendEncoded(encoded);
-            sendTime += Clock::now() - sendStarted;
+            {
+                std::lock_guard lock(slot.mutex);
+                slot.finished = true;
+            }
+            slot.ready.notify_one();
+        });
 
-            const auto frameFinished = Clock::now();
-            maximumFrameWork = std::max(
-                maximumFrameWork,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(frameFinished - frameWorkStarted));
-            if (frameFinished > nextFrameTime + frameDuration)
-                ++missedFrameDeadlines;
+        std::vector<std::uint8_t> nv12;
+        std::uint64_t submittedFrames{};
+        try
+        {
+            for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+            {
+                {
+                    std::unique_lock lock(slot.mutex);
+                    slot.ready.wait(lock, [&]
+                    {
+                        return slot.occupied || slot.finished || slot.failure;
+                    });
+                    if (slot.failure) std::rethrow_exception(slot.failure);
+                    if (!slot.occupied) break;
+                    nv12.swap(slot.nv12);
+                    slot.occupied = false;
+                }
+                slot.empty.notify_one();
+
+                const auto consumerWorkStarted = Clock::now();
+                const auto ptsUs = frameIndex * 1'000'000ULL / fps;
+                const auto encodingStarted = Clock::now();
+                const auto encodedFrames = encoder.Encode(nv12, ptsUs, frameIndex == 0);
+                encodingTime += Clock::now() - encodingStarted;
+                const auto sendStarted = Clock::now();
+                for (const auto& encoded : encodedFrames)
+                    sendEncoded(encoded);
+                sendTime += Clock::now() - sendStarted;
+                ++submittedFrames;
+
+                const auto frameFinished = Clock::now();
+                maximumConsumerWork = std::max(
+                    maximumConsumerWork,
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        frameFinished - consumerWorkStarted));
+                const auto frameDeadline = streamStarted + frameDuration * (frameIndex + 1);
+                if (frameFinished > frameDeadline)
+                    ++missedFrameDeadlines;
+            }
+            producer.join();
         }
+        catch (...)
+        {
+            {
+                std::lock_guard lock(slot.mutex);
+                slot.stop = true;
+                slot.occupied = false;
+            }
+            slot.empty.notify_all();
+            slot.ready.notify_all();
+            if (producer.joinable()) producer.join();
+            throw;
+        }
+        if (submittedFrames != frameCount)
+            throw std::runtime_error("The frame preparation pipeline stopped before completing the stream");
+
         const auto streamElapsed = Clock::now() - streamStarted;
         for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
         if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
@@ -882,8 +982,10 @@ namespace
             << averageMilliseconds(captureTime) << " ms capture, "
             << averageMilliseconds(conversionTime) << " ms BGRA->NV12, "
             << averageMilliseconds(encodingTime) << " ms encode, "
-            << averageMilliseconds(sendTime) << " ms send; max work "
-            << std::chrono::duration<double, std::milli>(maximumFrameWork).count()
+            << averageMilliseconds(sendTime) << " ms send; max producer "
+            << std::chrono::duration<double, std::milli>(maximumProducerWork).count()
+            << " ms, max encode/send "
+            << std::chrono::duration<double, std::milli>(maximumConsumerWork).count()
             << " ms; missed deadlines " << missedFrameDeadlines << '/' << frameCount << ".\n";
     }
 
