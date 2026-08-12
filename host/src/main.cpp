@@ -244,7 +244,39 @@ namespace
         throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
     }
 
-    void InjectTouch(std::span<const std::uint8_t> payload, const DisplayBounds& display)
+    void ReleaseTabletMouseButton(std::atomic_bool& primaryButtonDown) noexcept
+    {
+        if (!primaryButtonDown.exchange(false)) return;
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        (void)SendInput(1, &input, sizeof(input));
+    }
+
+    class TabletMouseButtonGuard
+    {
+    public:
+        explicit TabletMouseButtonGuard(std::atomic_bool& primaryButtonDown) noexcept
+            : primaryButtonDown_(primaryButtonDown)
+        {
+        }
+
+        TabletMouseButtonGuard(const TabletMouseButtonGuard&) = delete;
+        TabletMouseButtonGuard& operator=(const TabletMouseButtonGuard&) = delete;
+
+        ~TabletMouseButtonGuard()
+        {
+            ReleaseTabletMouseButton(primaryButtonDown_);
+        }
+
+    private:
+        std::atomic_bool& primaryButtonDown_;
+    };
+
+    void InjectTouch(
+        std::span<const std::uint8_t> payload,
+        const DisplayBounds& display,
+        std::atomic_bool& primaryButtonDown)
     {
         if (ReadLe<std::uint32_t>(payload, 0) != 1 || ReadLe<std::uint32_t>(payload, 4) != 0)
             throw std::runtime_error("TOUCH targets an unexpected stream or pointer");
@@ -276,6 +308,8 @@ namespace
         else if (action != 2) throw std::runtime_error("TOUCH has an unknown action");
         if (SendInput(1, &input, sizeof(input)) != 1)
             throw std::runtime_error("Windows rejected touch mouse input");
+        if (action == 1) primaryButtonDown = true;
+        else if (action == 3 || action == 4) primaryButtonDown = false;
     }
 
     [[nodiscard]] std::wstring EnvironmentValue(const wchar_t* name)
@@ -846,6 +880,8 @@ namespace
             throw std::runtime_error("Cannot configure the touch receiver timeout");
         std::atomic_bool forceKeyFrame{};
         std::atomic_uint64_t receivedTouches{};
+        std::atomic_bool primaryButtonDown{};
+        [[maybe_unused]] TabletMouseButtonGuard mouseButtonGuard(primaryButtonDown);
         std::mutex receiverFailureMutex;
         std::exception_ptr receiverFailure;
         std::jthread touchReceiver([&](std::stop_token stopToken)
@@ -878,7 +914,7 @@ namespace
                         const auto type = static_cast<MessageType>(message.header.messageType);
                         if (type == MessageType::Touch)
                         {
-                            InjectTouch(message.payload, displayBounds);
+                            InjectTouch(message.payload, displayBounds, primaryButtonDown);
                             ++receivedTouches;
                         }
                         else if (type == MessageType::RequestKeyframe)
