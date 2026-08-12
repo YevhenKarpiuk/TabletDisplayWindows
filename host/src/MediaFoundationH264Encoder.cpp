@@ -287,6 +287,15 @@ namespace tabletdisplay::host
 
         void WaitForEvent(MediaEventType expected)
         {
+            auto& pendingExpected = expected == METransformNeedInput
+                ? pendingNeedInput
+                : pendingHaveOutput;
+            if (pendingExpected != 0)
+            {
+                --pendingExpected;
+                return;
+            }
+
             for (;;)
             {
                 ComPtr<IMFMediaEvent> event;
@@ -297,6 +306,10 @@ namespace tabletdisplay::host
                 MediaEventType type{};
                 CheckHr(event->GetType(&type), "MFT event type");
                 if (type == expected) return;
+                if (type == METransformNeedInput)
+                    ++pendingNeedInput;
+                else if (type == METransformHaveOutput)
+                    ++pendingHaveOutput;
             }
         }
 
@@ -417,6 +430,7 @@ namespace tabletdisplay::host
                 ComPtr<IMFMediaType> changedType;
                 CheckHr(transform->GetOutputAvailableType(outputId, 0, &changedType), "GetOutputAvailableType");
                 CheckHr(transform->SetOutputType(outputId, changedType.Get(), 0), "SetOutputType(stream change)");
+                if (asynchronous) return std::nullopt;
                 return TryReadOutput();
             }
             CheckHr(hr, "ProcessOutput");
@@ -461,10 +475,16 @@ namespace tabletdisplay::host
             {
                 WaitForEvent(METransformNeedInput);
                 CheckHr(transform->ProcessInput(inputId, sample.Get(), 0), "ProcessInput(async)");
-                WaitForEvent(METransformHaveOutput);
-                auto encoded = TryReadOutput();
-                if (!encoded.has_value()) throw std::runtime_error("Asynchronous H.264 MFT signaled output without a sample");
-                output.push_back(std::move(*encoded));
+                for (;;)
+                {
+                    WaitForEvent(METransformHaveOutput);
+                    auto encoded = TryReadOutput();
+                    if (encoded.has_value())
+                    {
+                        output.push_back(std::move(*encoded));
+                        break;
+                    }
+                }
                 return output;
             }
 
@@ -527,6 +547,8 @@ namespace tabletdisplay::host
         DWORD outputId{};
         bool hardware{};
         bool asynchronous{};
+        std::uint32_t pendingNeedInput{};
+        std::uint32_t pendingHaveOutput{};
         bool ownsCom{};
         bool mediaFoundationStarted{};
     };

@@ -723,7 +723,7 @@ namespace
         const auto width = static_cast<std::uint16_t>(frame.width);
         const auto height = static_cast<std::uint16_t>(frame.height);
         tabletdisplay::host::MediaFoundationH264Encoder encoder({
-            width, height, fps, bitrate, false });
+            width, height, fps, bitrate, true });
         std::cout
             << "IddCx capture: virtual display -> " << width << 'x' << height
             << " @ " << fps << " FPS\n"
