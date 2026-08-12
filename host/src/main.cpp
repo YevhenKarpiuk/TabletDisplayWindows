@@ -1187,7 +1187,7 @@ namespace
             << "  TabletDisplayHost --demo [--serial SERIAL]\n"
             << "  TabletDisplayHost --encoder-demo [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
-            << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N]\n"
+            << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N] [--reconnect]\n"
             << "  TabletDisplayHost --version\n";
     }
 
@@ -1251,6 +1251,40 @@ namespace
         }
         return 0;
     }
+
+    int ReconnectingVirtualDisplayCommand(
+        const std::string& requestedSerial,
+        unsigned totalSeconds)
+    {
+        using Clock = std::chrono::steady_clock;
+        const auto deadline = Clock::now() + std::chrono::seconds(totalSeconds);
+        unsigned reconnectCount{};
+        while (Clock::now() < deadline)
+        {
+            const auto remaining = deadline - Clock::now();
+            const auto wholeSeconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
+            const auto attemptSeconds = static_cast<unsigned>(wholeSeconds.count()) +
+                (remaining > wholeSeconds ? 1U : 0U);
+            try
+            {
+                ConnectCommand(requestedSerial, RunMode::VirtualDisplay, attemptSeconds);
+                std::cout << "Continuous virtual-display stream completed after "
+                    << reconnectCount << " reconnect(s).\n";
+                return 0;
+            }
+            catch (const std::exception& exception)
+            {
+                if (Clock::now() >= deadline) break;
+                ++reconnectCount;
+                std::cerr << "Virtual-display connection lost: " << exception.what()
+                    << ". Reconnect attempt " << reconnectCount << " will start in 1 second.\n";
+                std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::seconds(1)));
+            }
+        }
+        std::cout << "Continuous virtual-display stream reached its time limit after "
+            << reconnectCount << " reconnect(s).\n";
+        return 0;
+    }
 }
 
 int main(int argc, char* argv[])
@@ -1282,6 +1316,7 @@ int main(int argc, char* argv[])
         {
             std::string serial;
             unsigned seconds = 10;
+            bool reconnect = false;
             for (int index = 2; index < argc; ++index)
             {
                 const std::string_view option = argv[index];
@@ -1297,9 +1332,13 @@ int main(int argc, char* argv[])
                     if (parsed == 0 || parsed > 3'600) throw std::runtime_error("--seconds must be in 1..3600");
                     seconds = parsed;
                 }
+                else if (option == "--reconnect" && command == "--virtual-stream")
+                {
+                    reconnect = true;
+                }
                 else
                 {
-                    throw std::runtime_error("Expected [--serial SERIAL] [--seconds N]");
+                    throw std::runtime_error("Expected [--serial SERIAL] [--seconds N] [--reconnect]");
                 }
             }
             const auto mode = command == "--virtual-stream"
@@ -1309,6 +1348,7 @@ int main(int argc, char* argv[])
                     : (command == "--encoder-demo"
                         ? RunMode::EncoderDemo
                         : (command == "--demo" ? RunMode::Synthetic : RunMode::Connect)));
+            if (reconnect) return ReconnectingVirtualDisplayCommand(serial, seconds);
             return ConnectCommand(serial, mode, seconds);
         }
         throw std::runtime_error("Unknown argument");
