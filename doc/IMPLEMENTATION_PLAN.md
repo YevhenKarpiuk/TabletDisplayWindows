@@ -1,6 +1,6 @@
 # План реализации TabletDisplayWindows
 
-> Статус 2026-08-12: IddCx установлен; реализован совместимый путь swap-chain → D3D11 staging → latest-frame IOCTL → Host → H.264. Следующий шаг — проверка `virtual-stream.cmd` на планшете и GPU zero-copy.
+> Статус 2026-08-13: виртуальный дисплей 1280×800@60 передаётся через Intel Quick Sync H.264 и аппаратно декодируется на планшете; реализованы frame pacing и асинхронный single-touch → Windows mouse. Следующий шаг — проверка точности tap/drag и длительный reconnect/soak-тест, затем GPU zero-copy.
 
 ## 1. Цель и границы MVP
 
