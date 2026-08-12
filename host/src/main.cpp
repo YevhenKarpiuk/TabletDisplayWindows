@@ -632,7 +632,7 @@ namespace
 
         const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
         auto nextFrameTime = std::chrono::steady_clock::now();
-        const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
+        const auto frameDuration = std::chrono::nanoseconds(1'000'000'000ULL / fps);
         for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
         {
             auto* yPlane = nv12.data();
@@ -686,7 +686,7 @@ namespace
             << "Media Foundation encoder: " << encoder.Name()
             << (encoder.IsHardware() ? " (hardware)" : " (software fallback)") << '\n';
 
-        const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
+        const auto frameDuration = std::chrono::nanoseconds(1'000'000'000ULL / fps);
         auto nextFrameTime = std::chrono::steady_clock::now();
         std::uint64_t frameId = 1;
         std::uint64_t bytesSent{};
@@ -807,7 +807,7 @@ namespace
             firstFrame = false;
         };
 
-        const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
+        const auto frameDuration = std::chrono::nanoseconds(1'000'000'000ULL / fps);
         using Clock = std::chrono::steady_clock;
         const auto streamStarted = Clock::now();
         const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
@@ -831,6 +831,7 @@ namespace
         std::chrono::nanoseconds maximumProducerWork{};
         std::chrono::nanoseconds maximumConsumerWork{};
         std::uint64_t missedFrameDeadlines{};
+        Clock::time_point cadenceOrigin{};
 
         std::thread producer([&]
         {
@@ -936,9 +937,14 @@ namespace
                     maximumConsumerWork,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         frameFinished - consumerWorkStarted));
-                const auto frameDeadline = streamStarted + frameDuration * (frameIndex + 1);
-                if (frameFinished > frameDeadline)
+                if (frameIndex == 0)
+                {
+                    cadenceOrigin = frameFinished;
+                }
+                else if (frameFinished > cadenceOrigin + frameDuration * frameIndex)
+                {
                     ++missedFrameDeadlines;
+                }
             }
             producer.join();
         }
@@ -986,7 +992,8 @@ namespace
             << std::chrono::duration<double, std::milli>(maximumProducerWork).count()
             << " ms, max encode/send "
             << std::chrono::duration<double, std::milli>(maximumConsumerWork).count()
-            << " ms; missed deadlines " << missedFrameDeadlines << '/' << frameCount << ".\n";
+            << " ms; late cadence frames " << missedFrameDeadlines << '/'
+            << (frameCount > 0 ? frameCount - 1 : 0) << ".\n";
     }
 
     void PrintHelp()
