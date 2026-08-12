@@ -25,6 +25,8 @@ using namespace Microsoft::WRL;
 #pragma region SampleMonitors
 
 static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 1;
+static constexpr GUID TABLET_DISPLAY_MONITOR_CONTAINER_ID =
+{ 0x05211a31, 0x67e4, 0x4536, { 0x9d, 0x42, 0xae, 0xfc, 0xdf, 0x0a, 0xf1, 0x83 } };
 
 // Default modes reported for edid-less monitors. The first mode is set as preferred
 static const struct IndirectSampleMonitor::SampleMonitorMode s_SampleDefaultModes[] =
@@ -571,16 +573,9 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
         MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_SampleMonitors[ConnectorIndex].pEdidBlock);
     }
 
-    // ==============================
-    // TODO: The monitor's container ID should be distinct from "this" device's container ID if the monitor is not
-    // permanently attached to the display adapter device object. The container ID is typically made unique for each
-    // monitor and can be used to associate the monitor with other devices, like audio or input devices. In this
-    // sample we generate a random container ID GUID, but it's best practice to choose a stable container ID for a
-    // unique monitor or to use "this" device's container ID for a permanent/integrated monitor.
-    // ==============================
-
-    // Create a container ID
-    CoCreateGuid(&MonitorInfo.MonitorContainerId);
+    // This monitor is permanently attached to the virtual adapter, so its identity must
+    // remain stable across driver restarts and Windows reboots.
+    MonitorInfo.MonitorContainerId = TABLET_DISPLAY_MONITOR_CONTAINER_ID;
 
     IDARG_IN_MONITORCREATE MonitorCreate = {};
     MonitorCreate.ObjectAttributes = &Attr;

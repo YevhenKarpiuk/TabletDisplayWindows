@@ -1,6 +1,6 @@
 # План реализации TabletDisplayWindows
 
-> Статус 2026-08-12: DXGI primary-desktop capture → BGRA/NV12 → Media Foundation H.264 → Android Surface проверен на Lenovo TB-X606F. Следующий шаг — test-sign/install IddCx и Driver/Host D3D11 IPC; CPU-capture пока использует software MFT.
+> Статус 2026-08-12: DXGI → H.264 → Android проверен. Test-signed IddCx установлен: `ROOT\DISPLAY\0000` и дочерний монитор запущены без ошибок при включённом Secure Boot. Следующий шаг — Driver/Host D3D11 IPC.
 
 ## 1. Цель и границы MVP
 

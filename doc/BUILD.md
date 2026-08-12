@@ -14,6 +14,10 @@
 build.cmd Debug
 build.cmd Release
 test.cmd
+sign-driver.cmd Release
+install-driver.cmd Release
+check-driver.cmd
+uninstall-driver.cmd
 connect.cmd [--serial SERIAL]
 demo.cmd [--serial SERIAL]
 encoder-demo.cmd [--serial SERIAL] [--seconds N]
@@ -22,10 +26,25 @@ stream.cmd [--serial SERIAL] [--seconds N]
 
 - `build.cmd` восстанавливает portable WDK/SDK и собирает solution без подписи.
 - `test.cmd` запускает parser/golden, H.264 и BGRA→NV12/Annex B tests.
+- `sign-driver.cmd` создаёт/переиспользует локальный test certificate, экспортирует публичную часть в `artifacts\cert` и подписывает CAT.
+- `install-driver.cmd` повторно собирает и подписывает пакет, запрашивает UAC, доверяет сертификату на этом компьютере и создаёт root-enumerated IddCx-устройство.
+- `check-driver.cmd` находит root-enumerated display по hardware ID и показывает состояние PnP-устройства и problem code.
+- `uninstall-driver.cmd` запрашивает UAC и удаляет устройство, пакет и созданный test certificate.
 - `encoder-demo.cmd` кодирует динамический 1280×800/30 паттерн штатным software H264 MFT и передаёт его Android.
 - `stream.cmd` захватывает основной дисплей через DXGI Desktop Duplication, преобразует BGRA→NV12 и передаёт H.264. Нужен интерактивный desktop.
 
 Артефакты: `artifacts\x64\<Configuration>`.
+
+## Test-signing
+
+Сначала запускается обычный `install-driver.cmd Release`. На проверенной Windows 11 test-signed UMDF/IddCx-пакет загрузился с доверенным локальным сертификатом при включённом Secure Boot. Если на другой системе устройство установлено с problem code 52, нужен Windows Test Mode:
+
+1. Сохранить BitLocker recovery key, если шифрование включено.
+2. Отключить Secure Boot в UEFI.
+3. Запустить `enable-test-signing.cmd` и подтвердить UAC.
+4. Перезагрузить Windows и повторить `install-driver.cmd Release`.
+
+`enable-test-signing.cmd` не отключает Secure Boot, BitLocker и не перезагружает компьютер автоматически. Официальная справка: [Loading Test Signed Code](https://learn.microsoft.com/windows-hardware/drivers/install/the-testsigning-boot-configuration-option).
 
 ## Текущее состояние
 
@@ -34,4 +53,4 @@ stream.cmd [--serial SERIAL] [--seconds N]
 - Software H264 MFT проверен FFmpeg (Constrained Baseline 1280×800) и планшетом: 150/150 кадров, аппаратный MTK decoder.
 - Intel Quick Sync MFT обнаружен; hardware output будет активирован с прямым GPU frame path от IddCx.
 - Песочница/служба не имеет права `IDXGIOutput1::DuplicateOutput`; `stream.cmd` запускается как обычное пользовательское приложение.
-- INF/CAT ранее проверены штатной Release-сборкой; для установки нужна test-signing конфигурация.
+- INF/CAT проверены Release-сборкой; `ROOT\DISPLAY\0000` и дочерний монитор запущены без ошибок, перезагрузка и Test Mode не потребовались.

@@ -7,10 +7,11 @@ Windows-часть системы, превращающей Android-планше
 - Стек: C++20, UMDF 2/IddCx, D3D11/DXGI, Media Foundation, Winsock, MSBuild/WDK.
 - Транспорт: `adb forward tcp:27183 tcp:27183`, protocol v1 из `doc/PROTOCOL.md`.
 - Инструменты: VS 2022 + WDK/Spectre; portable WDK 10.0.26100.6584, Android SDK и FFmpeg 9.0.1 в `C:\tools`.
-- Команды: `build.cmd Debug|Release`, `test.cmd`, `demo.cmd`, `encoder-demo.cmd`, `stream.cmd`.
+- Команды: `build.cmd`, `test.cmd`, `install-driver.cmd`, `check-driver.cmd`, `uninstall-driver.cmd`, `demo.cmd`, `encoder-demo.cmd`, `stream.cmd`.
 - Готово: IddCx-каркас; parser/tests; ADB session; synthetic H.264; DXGI primary-desktop capture; BGRA→NV12; low-latency Media Foundation H.264 sender.
 - Lenovo TB-X606F: synthetic/MF H.264 и реальный DXGI desktop stream 1280×800 отображаются аппаратным `OMX.MTK.VIDEO.DECODER.AVC`; исправлен перекрывавший видео background Android `SurfaceView`.
 - CPU capture сейчас использует software H264 MFT. Intel Quick Sync обнаружен, но прямой hardware path будет включён вместе с D3D11-текстурами IddCx.
 - `stream.cmd` требует обычный интерактивный Windows-сеанс; Desktop Duplication недоступен из service/sandbox.
-- Далее: test-sign/install IddCx, Driver/Host IPC, передача D3D11 frame в encoder, reconnect и touch.
+- IddCx: test-signed пакет установлен при включённом Secure Boot; `ROOT\DISPLAY\0000` и дочерний монитор запущены без ошибок, monitor container GUID стабилен. Test Mode не нужен.
+- Далее: Driver/Host IPC, передача D3D11 frame в encoder, reconnect и touch.
 - Подробный план: [doc/IMPLEMENTATION_PLAN.md](doc/IMPLEMENTATION_PLAN.md).
