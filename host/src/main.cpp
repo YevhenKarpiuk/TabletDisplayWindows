@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -213,6 +214,68 @@ namespace
             device.cb = sizeof(device);
         }
         throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+    }
+
+    struct DisplayBounds
+    {
+        LONG left{};
+        LONG top{};
+        DWORD width{};
+        DWORD height{};
+    };
+
+    [[nodiscard]] DisplayBounds FindTabletDisplayBounds()
+    {
+        DISPLAY_DEVICEW device{};
+        device.cb = sizeof(device);
+        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
+        {
+            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display")
+            {
+                DEVMODEW mode{};
+                mode.dmSize = sizeof(mode);
+                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0))
+                    throw std::runtime_error("Cannot query the TabletDisplay position");
+                return { mode.dmPosition.x, mode.dmPosition.y, mode.dmPelsWidth, mode.dmPelsHeight };
+            }
+            device = {};
+            device.cb = sizeof(device);
+        }
+        throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+    }
+
+    void InjectTouch(std::span<const std::uint8_t> payload, const DisplayBounds& display)
+    {
+        if (ReadLe<std::uint32_t>(payload, 0) != 1 || ReadLe<std::uint32_t>(payload, 4) != 0)
+            throw std::runtime_error("TOUCH targets an unexpected stream or pointer");
+
+        const auto action = payload[8];
+        const auto normalizedX = ReadLe<std::uint16_t>(payload, 10);
+        const auto normalizedY = ReadLe<std::uint16_t>(payload, 12);
+        const auto virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        const auto virtualTop = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const auto virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        const auto virtualHeight = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (display.width < 2 || display.height < 2 || virtualWidth < 2 || virtualHeight < 2)
+            throw std::runtime_error("Windows reported invalid virtual desktop bounds");
+
+        const auto pixelX = static_cast<std::int64_t>(display.left) +
+            (static_cast<std::int64_t>(normalizedX) * (display.width - 1U) + 32'767) / 65'535;
+        const auto pixelY = static_cast<std::int64_t>(display.top) +
+            (static_cast<std::int64_t>(normalizedY) * (display.height - 1U) + 32'767) / 65'535;
+        const auto absoluteX = (pixelX - virtualLeft) * 65'535 / (virtualWidth - 1);
+        const auto absoluteY = (pixelY - virtualTop) * 65'535 / (virtualHeight - 1);
+
+        INPUT input{};
+        input.type = INPUT_MOUSE;
+        input.mi.dx = static_cast<LONG>(std::clamp<std::int64_t>(absoluteX, 0, 65'535));
+        input.mi.dy = static_cast<LONG>(std::clamp<std::int64_t>(absoluteY, 0, 65'535));
+        input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        if (action == 1) input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
+        else if (action == 3 || action == 4) input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+        else if (action != 2) throw std::runtime_error("TOUCH has an unknown action");
+        if (SendInput(1, &input, sizeof(input)) != 1)
+            throw std::runtime_error("Windows rejected touch mouse input");
     }
 
     [[nodiscard]] std::wstring EnvironmentValue(const wchar_t* name)
@@ -776,6 +839,78 @@ namespace
             << "Media Foundation encoder: " << encoder.Name()
             << (encoder.IsHardware() ? " (hardware)" : " (software fallback)") << '\n';
 
+        const auto displayBounds = FindTabletDisplayBounds();
+        const DWORD receiveTimeoutMs = 250;
+        if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+                reinterpret_cast<const char*>(&receiveTimeoutMs), sizeof(receiveTimeoutMs)) != 0)
+            throw std::runtime_error("Cannot configure the touch receiver timeout");
+        std::atomic_bool forceKeyFrame{};
+        std::atomic_uint64_t receivedTouches{};
+        std::mutex receiverFailureMutex;
+        std::exception_ptr receiverFailure;
+        std::jthread touchReceiver([&](std::stop_token stopToken)
+        {
+            try
+            {
+                IncrementalDecoder decoder(kMaxPayloadSize, false);
+                std::array<std::uint8_t, 16 * 1024> buffer{};
+                std::uint64_t expectedSequence = 4;
+                while (!stopToken.stop_requested())
+                {
+                    const auto count = recv(socket, reinterpret_cast<char*>(buffer.data()),
+                        static_cast<int>(buffer.size()), 0);
+                    if (count == SOCKET_ERROR)
+                    {
+                        if (WSAGetLastError() == WSAETIMEDOUT) continue;
+                        if (stopToken.stop_requested()) return;
+                        throw std::runtime_error("Android-to-Windows receive failed");
+                    }
+                    if (count == 0)
+                    {
+                        if (stopToken.stop_requested()) return;
+                        throw std::runtime_error("Android closed the streaming connection");
+                    }
+                    for (const auto& message : decoder.Feed(
+                            std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(count))))
+                    {
+                        if (message.header.sequence != expectedSequence++)
+                            throw std::runtime_error("Android-to-Windows message sequence gap");
+                        const auto type = static_cast<MessageType>(message.header.messageType);
+                        if (type == MessageType::Touch)
+                        {
+                            InjectTouch(message.payload, displayBounds);
+                            ++receivedTouches;
+                        }
+                        else if (type == MessageType::RequestKeyframe)
+                        {
+                            forceKeyFrame = true;
+                        }
+                        else if (type == MessageType::Error)
+                        {
+                            throw std::runtime_error("Android reported a streaming error");
+                        }
+                        else
+                        {
+                            throw std::runtime_error("Unexpected Android-to-Windows streaming message");
+                        }
+                    }
+                }
+            }
+            catch (...)
+            {
+                if (!stopToken.stop_requested())
+                {
+                    std::lock_guard lock(receiverFailureMutex);
+                    receiverFailure = std::current_exception();
+                }
+            }
+        });
+        const auto checkReceiver = [&]
+        {
+            std::lock_guard lock(receiverFailureMutex);
+            if (receiverFailure) std::rethrow_exception(receiverFailure);
+        };
+
         std::uint64_t frameId = 1;
         std::uint64_t bytesSent{};
         bool configSent{};
@@ -830,8 +965,9 @@ namespace
         std::chrono::nanoseconds sendTime{};
         std::chrono::nanoseconds maximumProducerWork{};
         std::chrono::nanoseconds maximumConsumerWork{};
-        std::uint64_t missedFrameDeadlines{};
-        Clock::time_point cadenceOrigin{};
+        std::chrono::nanoseconds maximumOutputInterval{};
+        std::uint64_t delayedOutputIntervals{};
+        Clock::time_point previousFrameFinished{};
 
         std::thread producer([&]
         {
@@ -908,6 +1044,7 @@ namespace
         {
             for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
             {
+                checkReceiver();
                 {
                     std::unique_lock lock(slot.mutex);
                     slot.ready.wait(lock, [&]
@@ -924,7 +1061,8 @@ namespace
                 const auto consumerWorkStarted = Clock::now();
                 const auto ptsUs = frameIndex * 1'000'000ULL / fps;
                 const auto encodingStarted = Clock::now();
-                const auto encodedFrames = encoder.Encode(nv12, ptsUs, frameIndex == 0);
+                const auto encodedFrames = encoder.Encode(
+                    nv12, ptsUs, frameIndex == 0 || forceKeyFrame.exchange(false));
                 encodingTime += Clock::now() - encodingStarted;
                 const auto sendStarted = Clock::now();
                 for (const auto& encoded : encodedFrames)
@@ -937,16 +1075,18 @@ namespace
                     maximumConsumerWork,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         frameFinished - consumerWorkStarted));
-                if (frameIndex == 0)
+                if (frameIndex != 0)
                 {
-                    cadenceOrigin = frameFinished;
+                    const auto outputInterval = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        frameFinished - previousFrameFinished);
+                    maximumOutputInterval = std::max(maximumOutputInterval, outputInterval);
+                    if (outputInterval > frameDuration + std::chrono::milliseconds(2))
+                        ++delayedOutputIntervals;
                 }
-                else if (frameFinished > cadenceOrigin + frameDuration * frameIndex)
-                {
-                    ++missedFrameDeadlines;
-                }
+                previousFrameFinished = frameFinished;
             }
             producer.join();
+            checkReceiver();
         }
         catch (...)
         {
@@ -974,9 +1114,12 @@ namespace
             false,
             false,
             true));
+        touchReceiver.request_stop();
+        touchReceiver.join();
+        checkReceiver();
         std::cout
             << "Virtual-display stream completed: " << (frameId - 1) << " frames, "
-            << bytesSent << " encoded bytes.\n";
+            << bytesSent << " encoded bytes, " << receivedTouches.load() << " touch events.\n";
         const auto averageMilliseconds = [frameCount](std::chrono::nanoseconds duration)
         {
             return std::chrono::duration<double, std::milli>(duration).count() /
@@ -992,7 +1135,9 @@ namespace
             << std::chrono::duration<double, std::milli>(maximumProducerWork).count()
             << " ms, max encode/send "
             << std::chrono::duration<double, std::milli>(maximumConsumerWork).count()
-            << " ms; late cadence frames " << missedFrameDeadlines << '/'
+            << " ms; max output interval "
+            << std::chrono::duration<double, std::milli>(maximumOutputInterval).count()
+            << " ms, delayed intervals " << delayedOutputIntervals << '/'
             << (frameCount > 0 ? frameCount - 1 : 0) << ".\n";
     }
 
