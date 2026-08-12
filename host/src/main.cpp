@@ -677,12 +677,13 @@ namespace
         };
 
         const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
+        std::vector<std::uint8_t> nv12;
         for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
         {
             std::this_thread::sleep_until(nextFrameTime);
             const auto frame = capture.Capture();
-            const auto nv12 = tabletdisplay::video::BgraToNv12(
-                frame.bgra, frame.width, frame.height, frame.stride);
+            tabletdisplay::video::BgraToNv12(
+                frame.bgra, frame.width, frame.height, frame.stride, nv12);
             const auto ptsUs = frameIndex * 1'000'000ULL / fps;
             for (const auto& encoded : encoder.Encode(nv12, ptsUs, frameIndex == 0))
                 sendEncoded(encoded);
@@ -762,15 +763,27 @@ namespace
         };
 
         const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
-        auto nextFrameTime = std::chrono::steady_clock::now();
+        using Clock = std::chrono::steady_clock;
+        const auto streamStarted = Clock::now();
+        auto nextFrameTime = streamStarted;
         const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
+        std::vector<std::uint8_t> nv12;
+        std::chrono::nanoseconds captureTime{};
+        std::chrono::nanoseconds conversionTime{};
+        std::chrono::nanoseconds encodingTime{};
+        std::chrono::nanoseconds sendTime{};
+        std::chrono::nanoseconds maximumFrameWork{};
+        std::uint64_t missedFrameDeadlines{};
         for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
         {
+            auto frameWorkStarted = Clock::now();
             if (frameIndex != 0)
             {
                 nextFrameTime += frameDuration;
                 std::this_thread::sleep_until(nextFrameTime);
+                frameWorkStarted = Clock::now();
                 tabletdisplay::host::CapturedFrame latest{};
+                const auto captureStarted = Clock::now();
                 if (capture.Capture(latest, 0))
                 {
                     frame = latest;
@@ -780,14 +793,30 @@ namespace
                             "The virtual display mode changed during streaming; restart virtual-stream.cmd");
                     }
                 }
+                captureTime += Clock::now() - captureStarted;
             }
 
-            const auto nv12 = tabletdisplay::video::BgraToNv12(
-                frame.bgra, frame.width, frame.height, frame.stride);
+            const auto conversionStarted = Clock::now();
+            tabletdisplay::video::BgraToNv12(
+                frame.bgra, frame.width, frame.height, frame.stride, nv12);
+            conversionTime += Clock::now() - conversionStarted;
             const auto ptsUs = frameIndex * 1'000'000ULL / fps;
-            for (const auto& encoded : encoder.Encode(nv12, ptsUs, frameIndex == 0))
+            const auto encodingStarted = Clock::now();
+            const auto encodedFrames = encoder.Encode(nv12, ptsUs, frameIndex == 0);
+            encodingTime += Clock::now() - encodingStarted;
+            const auto sendStarted = Clock::now();
+            for (const auto& encoded : encodedFrames)
                 sendEncoded(encoded);
+            sendTime += Clock::now() - sendStarted;
+
+            const auto frameFinished = Clock::now();
+            maximumFrameWork = std::max(
+                maximumFrameWork,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(frameFinished - frameWorkStarted));
+            if (frameFinished > nextFrameTime + frameDuration)
+                ++missedFrameDeadlines;
         }
+        const auto streamElapsed = Clock::now() - streamStarted;
         for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
         if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
         SendMessage(socket, MakeVideoFrame(
@@ -801,6 +830,20 @@ namespace
         std::cout
             << "Virtual-display stream completed: " << (frameId - 1) << " frames, "
             << bytesSent << " encoded bytes.\n";
+        const auto averageMilliseconds = [frameCount](std::chrono::nanoseconds duration)
+        {
+            return std::chrono::duration<double, std::milli>(duration).count() /
+                static_cast<double>(frameCount);
+        };
+        std::cout
+            << "Pipeline timing: "
+            << std::chrono::duration<double>(streamElapsed).count() << " s loop, avg/frame "
+            << averageMilliseconds(captureTime) << " ms capture, "
+            << averageMilliseconds(conversionTime) << " ms BGRA->NV12, "
+            << averageMilliseconds(encodingTime) << " ms encode, "
+            << averageMilliseconds(sendTime) << " ms send; max work "
+            << std::chrono::duration<double, std::milli>(maximumFrameWork).count()
+            << " ms; missed deadlines " << missedFrameDeadlines << '/' << frameCount << ".\n";
     }
 
     void PrintHelp()

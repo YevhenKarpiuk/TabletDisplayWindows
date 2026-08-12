@@ -92,6 +92,18 @@ namespace tabletdisplay::video
         std::uint32_t height,
         std::size_t stride)
     {
+        std::vector<std::uint8_t> nv12;
+        BgraToNv12(bgra, width, height, stride, nv12);
+        return nv12;
+    }
+
+    void BgraToNv12(
+        std::span<const std::uint8_t> bgra,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::size_t stride,
+        std::vector<std::uint8_t>& nv12)
+    {
         if (width == 0 || height == 0 || (width & 1U) != 0 || (height & 1U) != 0)
             throw std::invalid_argument("NV12 dimensions must be non-zero and even");
         if (stride < static_cast<std::size_t>(width) * 4U ||
@@ -100,47 +112,43 @@ namespace tabletdisplay::video
             throw std::invalid_argument("BGRA buffer is too small");
 
         const auto ySize = static_cast<std::size_t>(width) * height;
-        std::vector<std::uint8_t> nv12(ySize + ySize / 2U);
-        for (std::uint32_t row = 0; row < height; ++row)
-        {
-            const auto* source = bgra.data() + static_cast<std::size_t>(row) * stride;
-            auto* yPlane = nv12.data() + static_cast<std::size_t>(row) * width;
-            for (std::uint32_t column = 0; column < width; ++column)
-            {
-                const int blue = source[column * 4U];
-                const int green = source[column * 4U + 1U];
-                const int red = source[column * 4U + 2U];
-                yPlane[column] = ClampByte(((66 * red + 129 * green + 25 * blue + 128) >> 8) + 16);
-            }
-        }
-
+        nv12.resize(ySize + ySize / 2U);
         auto* uvPlane = nv12.data() + ySize;
         for (std::uint32_t row = 0; row < height; row += 2)
         {
+            const auto* source0 = bgra.data() + static_cast<std::size_t>(row) * stride;
+            const auto* source1 = source0 + stride;
+            auto* yPlane0 = nv12.data() + static_cast<std::size_t>(row) * width;
+            auto* yPlane1 = yPlane0 + width;
+            auto* uvRow = uvPlane + static_cast<std::size_t>(row / 2U) * width;
             for (std::uint32_t column = 0; column < width; column += 2)
             {
-                int red{};
-                int green{};
-                int blue{};
-                for (std::uint32_t y = 0; y < 2; ++y)
-                {
-                    const auto* source = bgra.data() + static_cast<std::size_t>(row + y) * stride;
-                    for (std::uint32_t x = 0; x < 2; ++x)
-                    {
-                        blue += source[(column + x) * 4U];
-                        green += source[(column + x) * 4U + 1U];
-                        red += source[(column + x) * 4U + 2U];
-                    }
-                }
-                red /= 4;
-                green /= 4;
-                blue /= 4;
-                const auto uvOffset = static_cast<std::size_t>(row / 2U) * width + column;
-                uvPlane[uvOffset] = ClampByte(((-38 * red - 74 * green + 112 * blue + 128) >> 8) + 128);
-                uvPlane[uvOffset + 1U] = ClampByte(((112 * red - 94 * green - 18 * blue + 128) >> 8) + 128);
+                const auto offset = static_cast<std::size_t>(column) * 4U;
+                const int blue00 = source0[offset];
+                const int green00 = source0[offset + 1U];
+                const int red00 = source0[offset + 2U];
+                const int blue01 = source0[offset + 4U];
+                const int green01 = source0[offset + 5U];
+                const int red01 = source0[offset + 6U];
+                const int blue10 = source1[offset];
+                const int green10 = source1[offset + 1U];
+                const int red10 = source1[offset + 2U];
+                const int blue11 = source1[offset + 4U];
+                const int green11 = source1[offset + 5U];
+                const int red11 = source1[offset + 6U];
+
+                yPlane0[column] = ClampByte(((66 * red00 + 129 * green00 + 25 * blue00 + 128) >> 8) + 16);
+                yPlane0[column + 1U] = ClampByte(((66 * red01 + 129 * green01 + 25 * blue01 + 128) >> 8) + 16);
+                yPlane1[column] = ClampByte(((66 * red10 + 129 * green10 + 25 * blue10 + 128) >> 8) + 16);
+                yPlane1[column + 1U] = ClampByte(((66 * red11 + 129 * green11 + 25 * blue11 + 128) >> 8) + 16);
+
+                const int red = (red00 + red01 + red10 + red11) / 4;
+                const int green = (green00 + green01 + green10 + green11) / 4;
+                const int blue = (blue00 + blue01 + blue10 + blue11) / 4;
+                uvRow[column] = ClampByte(((-38 * red - 74 * green + 112 * blue + 128) >> 8) + 128);
+                uvRow[column + 1U] = ClampByte(((112 * red - 94 * green - 18 * blue + 128) >> 8) + 128);
             }
         }
-        return nv12;
     }
 
     bool HasAnnexBStartCode(std::span<const std::uint8_t> bytes) noexcept
