@@ -9,7 +9,7 @@ Windows-часть системы, превращающей Android-планше
 - Инструменты: VS 2022 + WDK/Spectre; portable WDK 10.0.26100.6584, Android SDK и FFmpeg 9.0.1 в `C:\tools`.
 - Команды: `build.cmd Debug|Release`, `test.cmd`, `demo.cmd`, `encoder-demo.cmd`, `stream.cmd`.
 - Готово: IddCx-каркас; parser/tests; ADB session; synthetic H.264; DXGI primary-desktop capture; BGRA→NV12; low-latency Media Foundation H.264 sender.
-- Lenovo TB-X606F: synthetic fixture и 150 MF-кадров 1280×800 приняты аппаратным `OMX.MTK.VIDEO.DECODER.AVC`; средняя codec latency ≈9,7 мс.
+- Lenovo TB-X606F: synthetic/MF H.264 и реальный DXGI desktop stream 1280×800 отображаются аппаратным `OMX.MTK.VIDEO.DECODER.AVC`; исправлен перекрывавший видео background Android `SurfaceView`.
 - CPU capture сейчас использует software H264 MFT. Intel Quick Sync обнаружен, но прямой hardware path будет включён вместе с D3D11-текстурами IddCx.
 - `stream.cmd` требует обычный интерактивный Windows-сеанс; Desktop Duplication недоступен из service/sandbox.
 - Далее: test-sign/install IddCx, Driver/Host IPC, передача D3D11 frame в encoder, reconnect и touch.

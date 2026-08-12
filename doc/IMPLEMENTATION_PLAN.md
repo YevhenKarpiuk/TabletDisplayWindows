@@ -1,6 +1,6 @@
 # План реализации TabletDisplayWindows
 
-> Статус 2026-08-12: кроме synthetic transport реализованы DXGI primary-desktop capture, BGRA→NV12 и low-latency Media Foundation H.264 sender. Сквозной MF-тест передал 150 кадров аппаратному Android decoder. Следующий шаг — test-sign/install IddCx и Driver/Host D3D11 IPC; CPU-capture пока использует software MFT.
+> Статус 2026-08-12: DXGI primary-desktop capture → BGRA/NV12 → Media Foundation H.264 → Android Surface проверен на Lenovo TB-X606F. Следующий шаг — test-sign/install IddCx и Driver/Host D3D11 IPC; CPU-capture пока использует software MFT.
 
 ## 1. Цель и границы MVP
 
