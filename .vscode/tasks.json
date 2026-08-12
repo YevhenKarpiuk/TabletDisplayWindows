@@ -26,6 +26,13 @@
       "problemMatcher": []
     },
     {
+      "label": "run: USB handshake",
+      "type": "process",
+      "command": "${workspaceFolder}\\connect.cmd",
+      "dependsOn": "build: debug x64",
+      "problemMatcher": []
+    },
+    {
       "label": "test: protocol",
       "type": "process",
       "command": "${workspaceFolder}\\test.cmd",

@@ -53,12 +53,15 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="..\shared\protocol\Protocol.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\shared\protocol\Protocol.h" />
     <ClInclude Include="..\shared\protocol\ProtocolConstants.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
