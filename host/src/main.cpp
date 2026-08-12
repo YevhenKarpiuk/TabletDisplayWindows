@@ -171,6 +171,46 @@ namespace
         return output;
     }
 
+    void ConfigureTabletDisplayMode(
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t frequency)
+    {
+        DISPLAY_DEVICEW device{};
+        device.cb = sizeof(device);
+        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
+        {
+            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display")
+            {
+                DEVMODEW mode{};
+                mode.dmSize = sizeof(mode);
+                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0))
+                    throw std::runtime_error("Cannot query the TabletDisplay mode");
+                if (mode.dmPelsWidth == width && mode.dmPelsHeight == height &&
+                    mode.dmDisplayFrequency == frequency)
+                    return;
+
+                mode.dmPelsWidth = width;
+                mode.dmPelsHeight = height;
+                mode.dmDisplayFrequency = frequency;
+                mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+                const auto testResult = ChangeDisplaySettingsExW(
+                    device.DeviceName, &mode, nullptr, CDS_TEST, nullptr);
+                if (testResult != DISP_CHANGE_SUCCESSFUL)
+                    throw std::runtime_error("Windows rejected the 1280x800 @ 60 Hz TabletDisplay mode");
+                const auto applyResult = ChangeDisplaySettingsExW(
+                    device.DeviceName, &mode, nullptr, CDS_UPDATEREGISTRY, nullptr);
+                if (applyResult != DISP_CHANGE_SUCCESSFUL)
+                    throw std::runtime_error("Windows could not apply the 1280x800 @ 60 Hz TabletDisplay mode");
+                std::cout << "Windows display mode: 1280x800 @ 60 Hz\n";
+                return;
+            }
+            device = {};
+            device.cb = sizeof(device);
+        }
+        throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+    }
+
     [[nodiscard]] std::wstring EnvironmentValue(const wchar_t* name)
     {
         const auto size = GetEnvironmentVariableW(name, nullptr, 0);
@@ -706,23 +746,24 @@ namespace
 
     void RunVirtualDisplayStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
     {
-        constexpr std::uint16_t fps = 30;
+        constexpr std::uint16_t width = 1280;
+        constexpr std::uint16_t height = 800;
+        constexpr std::uint16_t fps = 60;
         constexpr std::uint32_t bitrate = 8'000'000;
+        ConfigureTabletDisplayMode(width, height, fps);
         tabletdisplay::host::IddFrameCapture capture;
         tabletdisplay::host::CapturedFrame frame{};
-        if (!capture.Capture(frame, 5'000))
+        const auto modeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((frame.width != width || frame.height != height) &&
+            std::chrono::steady_clock::now() < modeDeadline)
+        {
+            (void)capture.Capture(frame, 500);
+        }
+        if (frame.width != width || frame.height != height)
         {
             throw std::runtime_error(
-                "No IddCx frame is available. Select 'Extend these displays' in Windows display settings");
+                "No 1280x800 IddCx frame is available. Select 'Extend these displays' in Windows display settings");
         }
-
-        if (frame.width > std::numeric_limits<std::uint16_t>::max() ||
-            frame.height > std::numeric_limits<std::uint16_t>::max())
-        {
-            throw std::runtime_error("The virtual display mode is too large for protocol v1");
-        }
-        const auto width = static_cast<std::uint16_t>(frame.width);
-        const auto height = static_cast<std::uint16_t>(frame.height);
         tabletdisplay::host::MediaFoundationH264Encoder encoder({
             width, height, fps, bitrate, true });
         std::cout
