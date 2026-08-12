@@ -130,6 +130,7 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 
 EVT_WDF_DRIVER_DEVICE_ADD IddSampleDeviceAdd;
 EVT_WDF_DEVICE_D0_ENTRY IddSampleDeviceD0Entry;
+EVT_IDD_CX_DEVICE_IO_CONTROL IddSampleDeviceIoControl;
 
 EVT_IDD_CX_ADAPTER_INIT_FINISHED IddSampleAdapterInitFinished;
 EVT_IDD_CX_ADAPTER_COMMIT_MODES IddSampleAdapterCommitModes;
@@ -221,9 +222,9 @@ NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     IDD_CX_CLIENT_CONFIG IddConfig;
     IDD_CX_CLIENT_CONFIG_INIT(&IddConfig);
 
-    // If the driver wishes to handle custom IoDeviceControl requests, it's necessary to use this callback since IddCx
-    // redirects IoDeviceControl requests to an internal queue. This sample does not need this.
-    // IddConfig.EvtIddCxDeviceIoControl = IddSampleIoDeviceControl;
+    // IddCx redirects custom IOCTL requests to this callback. TabletDisplay uses one read-only
+    // request to move the latest virtual-display frame into the interactive host process.
+    IddConfig.EvtIddCxDeviceIoControl = IddSampleDeviceIoControl;
 
     IddConfig.EvtIddCxAdapterInitFinished = IddSampleAdapterInitFinished;
 
@@ -260,6 +261,19 @@ NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     }
 
     Status = IddCxDeviceInitialize(Device);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    Status = WdfDeviceCreateDeviceInterface(
+        Device,
+        &tabletdisplay::ipc::kFrameDeviceInterface,
+        nullptr);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
 
     // Create a new device context object and attach it to the WDF device object
     auto* pContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
@@ -324,10 +338,113 @@ HRESULT Direct3DDevice::Init()
 
 #pragma endregion
 
+#pragma region FrameStore
+
+FrameStore::FrameStore()
+{
+    InitializeSRWLock(&m_Lock);
+}
+
+bool FrameStore::Publish(
+    const void* pixels,
+    UINT width,
+    UINT height,
+    UINT sourceStride,
+    UINT64 timestampUs)
+{
+    if (pixels == nullptr || width == 0 || height == 0 ||
+        width > tabletdisplay::ipc::kMaxFrameWidth ||
+        height > tabletdisplay::ipc::kMaxFrameHeight)
+    {
+        return false;
+    }
+
+    const UINT destinationStride = width * tabletdisplay::ipc::kBytesPerPixel;
+    const size_t frameBytes = static_cast<size_t>(destinationStride) * height;
+    if (sourceStride < destinationStride || frameBytes > tabletdisplay::ipc::kMaxFrameBytes)
+    {
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&m_Lock);
+    try
+    {
+        m_Pixels.resize(frameBytes);
+    }
+    catch (...)
+    {
+        ReleaseSRWLockExclusive(&m_Lock);
+        return false;
+    }
+
+    const auto* source = static_cast<const BYTE*>(pixels);
+    for (UINT row = 0; row < height; ++row)
+    {
+        memcpy(
+            m_Pixels.data() + static_cast<size_t>(row) * destinationStride,
+            source + static_cast<size_t>(row) * sourceStride,
+            destinationStride);
+    }
+
+    m_Header.magic = tabletdisplay::ipc::kFrameMagic;
+    m_Header.versionMajor = tabletdisplay::ipc::kFrameVersionMajor;
+    m_Header.versionMinor = tabletdisplay::ipc::kFrameVersionMinor;
+    m_Header.headerBytes = sizeof(m_Header);
+    m_Header.pixelFormat = tabletdisplay::ipc::kPixelFormatBgra8;
+    m_Header.width = width;
+    m_Header.height = height;
+    m_Header.stride = destinationStride;
+    m_Header.frameBytes = static_cast<UINT>(frameBytes);
+    ++m_Header.sequence;
+    m_Header.timestampUs = timestampUs;
+    ReleaseSRWLockExclusive(&m_Lock);
+    return true;
+}
+
+NTSTATUS FrameStore::CopyLatest(
+    UINT64 afterSequence,
+    void* output,
+    size_t outputBytes,
+    size_t* bytesWritten)
+{
+    if (bytesWritten == nullptr)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *bytesWritten = 0;
+
+    AcquireSRWLockShared(&m_Lock);
+    if (m_Header.sequence == 0 || m_Header.sequence <= afterSequence)
+    {
+        ReleaseSRWLockShared(&m_Lock);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    const size_t requiredBytes = sizeof(m_Header) + m_Pixels.size();
+    if (output == nullptr || outputBytes < requiredBytes)
+    {
+        ReleaseSRWLockShared(&m_Lock);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    memcpy(output, &m_Header, sizeof(m_Header));
+    memcpy(static_cast<BYTE*>(output) + sizeof(m_Header), m_Pixels.data(), m_Pixels.size());
+    *bytesWritten = requiredBytes;
+    ReleaseSRWLockShared(&m_Lock);
+    return STATUS_SUCCESS;
+}
+
+#pragma endregion
+
 #pragma region SwapChainProcessor
 
-SwapChainProcessor::SwapChainProcessor(IDDCX_SWAPCHAIN hSwapChain, shared_ptr<Direct3DDevice> Device, HANDLE NewFrameEvent)
-    : m_hSwapChain(hSwapChain), m_Device(Device), m_hAvailableBufferEvent(NewFrameEvent)
+SwapChainProcessor::SwapChainProcessor(
+    IDDCX_SWAPCHAIN hSwapChain,
+    shared_ptr<Direct3DDevice> Device,
+    shared_ptr<FrameStore> Frames,
+    HANDLE NewFrameEvent)
+    : m_hSwapChain(hSwapChain), m_Device(Device), m_Frames(Frames),
+      m_hAvailableBufferEvent(NewFrameEvent)
 {
     m_hTerminateEvent.Attach(CreateEvent(nullptr, FALSE, FALSE, nullptr));
 
@@ -389,6 +506,9 @@ void SwapChainProcessor::RunCore()
         return;
     }
 
+    ComPtr<ID3D11Texture2D> StagingTexture;
+    D3D11_TEXTURE2D_DESC StagingDescription = {};
+
     // Acquire and release buffers in a loop
     for (;;)
     {
@@ -430,16 +550,73 @@ void SwapChainProcessor::RunCore()
             // We have new frame to process, the surface has a reference on it that the driver has to release
             AcquiredBuffer.Attach(Buffer.MetaData.pSurface);
 
-            // ==============================
-            // TODO: Process the frame here
-            //
-            // This is the most performance-critical section of code in an IddCx driver. It's important that whatever
-            // is done with the acquired surface be finished as quickly as possible. This operation could be:
-            //  * a GPU copy to another buffer surface for later processing (such as a staging surface for mapping to CPU memory)
-            //  * a GPU encode operation
-            //  * a GPU VPBlt to another surface
-            //  * a GPU custom compute shader encode operation
-            // ==============================
+            ComPtr<ID3D11Texture2D> SourceTexture;
+            if (SUCCEEDED(AcquiredBuffer.As(&SourceTexture)))
+            {
+                D3D11_TEXTURE2D_DESC SourceDescription = {};
+                SourceTexture->GetDesc(&SourceDescription);
+                const bool supportedFormat =
+                    SourceDescription.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                    SourceDescription.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+                const bool supportedSize =
+                    SourceDescription.Width <= tabletdisplay::ipc::kMaxFrameWidth &&
+                    SourceDescription.Height <= tabletdisplay::ipc::kMaxFrameHeight;
+                if (supportedFormat && supportedSize)
+                {
+                    if (!StagingTexture ||
+                        StagingDescription.Width != SourceDescription.Width ||
+                        StagingDescription.Height != SourceDescription.Height ||
+                        StagingDescription.Format != SourceDescription.Format)
+                    {
+                        StagingDescription = SourceDescription;
+                        StagingDescription.BindFlags = 0;
+                        StagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                        StagingDescription.Usage = D3D11_USAGE_STAGING;
+                        StagingDescription.MiscFlags = 0;
+                        StagingDescription.ArraySize = 1;
+                        StagingDescription.MipLevels = 1;
+                        StagingDescription.SampleDesc.Count = 1;
+                        StagingDescription.SampleDesc.Quality = 0;
+                        StagingTexture.Reset();
+                        (void)m_Device->Device->CreateTexture2D(
+                            &StagingDescription,
+                            nullptr,
+                            &StagingTexture);
+                    }
+
+                    if (StagingTexture)
+                    {
+                        m_Device->DeviceContext->CopyResource(
+                            StagingTexture.Get(),
+                            SourceTexture.Get());
+                        D3D11_MAPPED_SUBRESOURCE Mapped = {};
+                        if (SUCCEEDED(m_Device->DeviceContext->Map(
+                                StagingTexture.Get(),
+                                0,
+                                D3D11_MAP_READ,
+                                0,
+                                &Mapped)))
+                        {
+                            LARGE_INTEGER Counter = {};
+                            LARGE_INTEGER Frequency = {};
+                            QueryPerformanceCounter(&Counter);
+                            QueryPerformanceFrequency(&Frequency);
+                            const UINT64 TimestampUs = Frequency.QuadPart > 0
+                                ? static_cast<UINT64>(Counter.QuadPart / Frequency.QuadPart) * 1'000'000ULL +
+                                  static_cast<UINT64>(Counter.QuadPart % Frequency.QuadPart) * 1'000'000ULL /
+                                      static_cast<UINT64>(Frequency.QuadPart)
+                                : 0;
+                            (void)m_Frames->Publish(
+                                Mapped.pData,
+                                SourceDescription.Width,
+                                SourceDescription.Height,
+                                Mapped.RowPitch,
+                                TimestampUs);
+                            m_Device->DeviceContext->Unmap(StagingTexture.Get(), 0);
+                        }
+                    }
+                }
+            }
 
             // We have finished processing this frame hence we release the reference on it.
             // If the driver forgets to release the reference to the surface, it will be leaked which results in the
@@ -478,13 +655,22 @@ void SwapChainProcessor::RunCore()
 #pragma region IndirectDeviceContext
 
 IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
-    m_WdfDevice(WdfDevice)
+    m_WdfDevice(WdfDevice), m_Frames(make_shared<FrameStore>())
 {
     m_Adapter = {};
 }
 
 IndirectDeviceContext::~IndirectDeviceContext()
 {
+}
+
+NTSTATUS IndirectDeviceContext::CopyLatestFrame(
+    UINT64 afterSequence,
+    void* output,
+    size_t outputBytes,
+    size_t* bytesWritten)
+{
+    return m_Frames->CopyLatest(afterSequence, output, outputBytes, bytesWritten);
 }
 
 void IndirectDeviceContext::InitAdapter()
@@ -588,7 +774,9 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     {
         // Create a new monitor context object and attach it to the Idd monitor object
         auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
-        pMonitorContextWrapper->pContext = new IndirectMonitorContext(MonitorCreateOut.MonitorObject);
+        pMonitorContextWrapper->pContext = new IndirectMonitorContext(
+            MonitorCreateOut.MonitorObject,
+            m_Frames);
 
         // Tell the OS that the monitor has been plugged in
         IDARG_OUT_MONITORARRIVAL ArrivalOut;
@@ -596,8 +784,10 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     }
 }
 
-IndirectMonitorContext::IndirectMonitorContext(_In_ IDDCX_MONITOR Monitor) :
-    m_Monitor(Monitor)
+IndirectMonitorContext::IndirectMonitorContext(
+    _In_ IDDCX_MONITOR Monitor,
+    shared_ptr<FrameStore> Frames) :
+    m_Monitor(Monitor), m_Frames(Frames)
 {
 }
 
@@ -620,7 +810,11 @@ void IndirectMonitorContext::AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID Ren
     else
     {
         // Create a new swap-chain processing thread
-        m_ProcessingThread.reset(new SwapChainProcessor(SwapChain, Device, NewFrameEvent));
+        m_ProcessingThread.reset(new SwapChainProcessor(
+            SwapChain,
+            Device,
+            m_Frames,
+            NewFrameEvent));
     }
 }
 
@@ -633,6 +827,69 @@ void IndirectMonitorContext::UnassignSwapChain()
 #pragma endregion
 
 #pragma region DDI Callbacks
+
+_Use_decl_annotations_
+VOID IddSampleDeviceIoControl(
+    WDFDEVICE Device,
+    WDFREQUEST Request,
+    size_t OutputBufferLength,
+    size_t InputBufferLength,
+    ULONG IoControlCode)
+{
+    NTSTATUS Status = STATUS_INVALID_DEVICE_REQUEST;
+    size_t BytesWritten = 0;
+
+    if (IoControlCode == tabletdisplay::ipc::kGetLatestFrameIoctl)
+    {
+        tabletdisplay::ipc::FrameRequest* FrameRequest = nullptr;
+        void* Output = nullptr;
+        if (InputBufferLength < sizeof(*FrameRequest) ||
+            OutputBufferLength < sizeof(tabletdisplay::ipc::FrameResponseHeader))
+        {
+            Status = STATUS_BUFFER_TOO_SMALL;
+        }
+        else
+        {
+            Status = WdfRequestRetrieveInputBuffer(
+                Request,
+                sizeof(*FrameRequest),
+                reinterpret_cast<void**>(&FrameRequest),
+                nullptr);
+            if (NT_SUCCESS(Status) &&
+                (FrameRequest->structureBytes != sizeof(*FrameRequest) ||
+                 FrameRequest->reserved != 0))
+            {
+                Status = STATUS_INVALID_PARAMETER;
+            }
+            if (NT_SUCCESS(Status))
+            {
+                Status = WdfRequestRetrieveOutputBuffer(
+                    Request,
+                    sizeof(tabletdisplay::ipc::FrameResponseHeader),
+                    &Output,
+                    nullptr);
+            }
+            if (NT_SUCCESS(Status))
+            {
+                auto* DeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+                if (DeviceContext == nullptr || DeviceContext->pContext == nullptr)
+                {
+                    Status = STATUS_DEVICE_NOT_READY;
+                }
+                else
+                {
+                    Status = DeviceContext->pContext->CopyLatestFrame(
+                        FrameRequest->afterSequence,
+                        Output,
+                        OutputBufferLength,
+                        &BytesWritten);
+                }
+            }
+        }
+    }
+
+    WdfRequestCompleteWithInformation(Request, Status, BytesWritten);
+}
 
 _Use_decl_annotations_
 NTSTATUS IddSampleAdapterInitFinished(IDDCX_ADAPTER AdapterObject, const IDARG_IN_ADAPTER_INIT_FINISHED* pInArgs)

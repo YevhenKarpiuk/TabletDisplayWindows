@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "DesktopCapture.h"
+#include "IddFrameCapture.h"
 #include "MediaFoundationH264Encoder.h"
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
@@ -40,7 +41,8 @@ namespace
         Connect,
         Synthetic,
         EncoderDemo,
-        Desktop
+        Desktop,
+        VirtualDisplay
     };
 
     struct ProcessResult
@@ -701,6 +703,106 @@ namespace
             << bytesSent << " encoded bytes.\n";
     }
 
+    void RunVirtualDisplayStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
+    {
+        constexpr std::uint16_t fps = 30;
+        constexpr std::uint32_t bitrate = 8'000'000;
+        tabletdisplay::host::IddFrameCapture capture;
+        tabletdisplay::host::CapturedFrame frame{};
+        if (!capture.Capture(frame, 5'000))
+        {
+            throw std::runtime_error(
+                "No IddCx frame is available. Select 'Extend these displays' in Windows display settings");
+        }
+
+        if (frame.width > std::numeric_limits<std::uint16_t>::max() ||
+            frame.height > std::numeric_limits<std::uint16_t>::max())
+        {
+            throw std::runtime_error("The virtual display mode is too large for protocol v1");
+        }
+        const auto width = static_cast<std::uint16_t>(frame.width);
+        const auto height = static_cast<std::uint16_t>(frame.height);
+        tabletdisplay::host::MediaFoundationH264Encoder encoder({
+            width, height, fps, bitrate, false });
+        std::cout
+            << "IddCx capture: virtual display -> " << width << 'x' << height
+            << " @ " << fps << " FPS\n"
+            << "Media Foundation encoder: " << encoder.Name()
+            << (encoder.IsHardware() ? " (hardware)" : " (software fallback)") << '\n';
+
+        std::uint64_t frameId = 1;
+        std::uint64_t bytesSent{};
+        bool configSent{};
+        bool firstFrame = true;
+        const auto sendEncoded = [&](const tabletdisplay::host::EncodedAccessUnit& encoded)
+        {
+            if (!configSent)
+            {
+                const auto* config = encoder.CodecConfig();
+                if (config == nullptr) throw std::runtime_error("H.264 encoder produced no SPS/PPS");
+                SendMessage(socket, MakeVideoConfig(
+                    nextSequence++, width, height, fps,
+                    config->profileIdc == 0 ? 66 : config->profileIdc,
+                    config->levelIdc == 0 ? 40 : config->levelIdc,
+                    bitrate,
+                    config->annexB));
+                configSent = true;
+            }
+            if (firstFrame && !encoded.keyFrame)
+                throw std::runtime_error("H.264 encoder did not produce an initial IDR");
+            SendMessage(socket, MakeVideoFrame(
+                nextSequence++,
+                frameId++,
+                encoded.presentationTimeUs,
+                encoded.bytes,
+                encoded.keyFrame,
+                firstFrame));
+            bytesSent += encoded.bytes.size();
+            firstFrame = false;
+        };
+
+        const auto frameDuration = std::chrono::microseconds(1'000'000 / fps);
+        auto nextFrameTime = std::chrono::steady_clock::now();
+        const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
+        for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+        {
+            if (frameIndex != 0)
+            {
+                nextFrameTime += frameDuration;
+                std::this_thread::sleep_until(nextFrameTime);
+                tabletdisplay::host::CapturedFrame latest{};
+                if (capture.Capture(latest, 0))
+                {
+                    frame = latest;
+                    if (frame.width != width || frame.height != height)
+                    {
+                        throw std::runtime_error(
+                            "The virtual display mode changed during streaming; restart virtual-stream.cmd");
+                    }
+                }
+            }
+
+            const auto nv12 = tabletdisplay::video::BgraToNv12(
+                frame.bgra, frame.width, frame.height, frame.stride);
+            const auto ptsUs = frameIndex * 1'000'000ULL / fps;
+            for (const auto& encoded : encoder.Encode(nv12, ptsUs, frameIndex == 0))
+                sendEncoded(encoded);
+        }
+        for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
+        if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
+        SendMessage(socket, MakeVideoFrame(
+            nextSequence++,
+            frameId,
+            static_cast<std::uint64_t>(seconds) * 1'000'000ULL,
+            {},
+            false,
+            false,
+            true));
+        std::cout
+            << "Virtual-display stream completed: " << (frameId - 1) << " frames, "
+            << bytesSent << " encoded bytes.\n";
+    }
+
     void PrintHelp()
     {
         std::cout
@@ -711,6 +813,7 @@ namespace
             << "  TabletDisplayHost --demo [--serial SERIAL]\n"
             << "  TabletDisplayHost --encoder-demo [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
+            << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --version\n";
     }
 
@@ -754,6 +857,10 @@ namespace
             {
                 RunDesktopStream(socket.get(), nextSequence, streamSeconds);
             }
+            else if (mode == RunMode::VirtualDisplay)
+            {
+                RunVirtualDisplayStream(socket.get(), nextSequence, streamSeconds);
+            }
             if (createdForward)
             {
                 const auto result = RunProcess(adb, selector + L"forward --remove tcp:27183");
@@ -784,7 +891,7 @@ int main(int argc, char* argv[])
         }
         if (command == "--version")
         {
-            std::cout << "TabletDisplayHost 0.4.0\n";
+            std::cout << "TabletDisplayHost 0.5.0\n";
             return 0;
         }
         if (command == "--check")
@@ -796,7 +903,8 @@ int main(int argc, char* argv[])
             return 0;
         }
         if (command == "--connect" || command == "--demo" ||
-            command == "--encoder-demo" || command == "--stream")
+            command == "--encoder-demo" || command == "--stream" ||
+            command == "--virtual-stream")
         {
             std::string serial;
             unsigned seconds = 10;
@@ -808,7 +916,8 @@ int main(int argc, char* argv[])
                     serial = argv[++index];
                 }
                 else if (option == "--seconds" && index + 1 < argc &&
-                    (command == "--stream" || command == "--encoder-demo"))
+                    (command == "--stream" || command == "--virtual-stream" ||
+                     command == "--encoder-demo"))
                 {
                     const auto parsed = std::stoul(argv[++index]);
                     if (parsed == 0 || parsed > 3'600) throw std::runtime_error("--seconds must be in 1..3600");
@@ -819,11 +928,13 @@ int main(int argc, char* argv[])
                     throw std::runtime_error("Expected [--serial SERIAL] [--seconds N]");
                 }
             }
-            const auto mode = command == "--stream"
-                ? RunMode::Desktop
-                : (command == "--encoder-demo"
-                    ? RunMode::EncoderDemo
-                    : (command == "--demo" ? RunMode::Synthetic : RunMode::Connect));
+            const auto mode = command == "--virtual-stream"
+                ? RunMode::VirtualDisplay
+                : (command == "--stream"
+                    ? RunMode::Desktop
+                    : (command == "--encoder-demo"
+                        ? RunMode::EncoderDemo
+                        : (command == "--demo" ? RunMode::Synthetic : RunMode::Connect)));
             return ConnectCommand(serial, mode, seconds);
         }
         throw std::runtime_error("Unknown argument");

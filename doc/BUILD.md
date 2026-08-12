@@ -22,6 +22,7 @@ connect.cmd [--serial SERIAL]
 demo.cmd [--serial SERIAL]
 encoder-demo.cmd [--serial SERIAL] [--seconds N]
 stream.cmd [--serial SERIAL] [--seconds N]
+virtual-stream.cmd [--serial SERIAL] [--seconds N]
 ```
 
 - `build.cmd` восстанавливает portable WDK/SDK и собирает solution без подписи.
@@ -32,6 +33,7 @@ stream.cmd [--serial SERIAL] [--seconds N]
 - `uninstall-driver.cmd` запрашивает UAC и удаляет устройство, пакет и созданный test certificate.
 - `encoder-demo.cmd` кодирует динамический 1280×800/30 паттерн штатным software H264 MFT и передаёт его Android.
 - `stream.cmd` захватывает основной дисплей через DXGI Desktop Duplication, преобразует BGRA→NV12 и передаёт H.264. Нужен интерактивный desktop.
+- `virtual-stream.cmd` включает расширенный desktop, получает кадры IddCx через device-interface IOCTL и передаёт виртуальный монитор на Android.
 
 Артефакты: `artifacts\x64\<Configuration>`.
 
@@ -48,8 +50,8 @@ stream.cmd [--serial SERIAL] [--seconds N]
 
 ## Текущее состояние
 
-- Driver — IddCx-база Microsoft IddSample; Driver/Host IPC ещё не реализован.
-- Host 0.4.0 — ADB/session, DXGI capture, CPU NV12 conversion, Media Foundation H.264 и protocol sender.
+- Driver — IddCx-база Microsoft IddSample; swap-chain копируется в latest-frame BGRA store и выдаётся Host через read-only IOCTL.
+- Host 0.5.0 — ADB/session, DXGI/IddCx capture, CPU NV12 conversion, Media Foundation H.264 и protocol sender.
 - Software H264 MFT проверен FFmpeg (Constrained Baseline 1280×800) и планшетом: 150/150 кадров, аппаратный MTK decoder.
 - Intel Quick Sync MFT обнаружен; hardware output будет активирован с прямым GPU frame path от IddCx.
 - Песочница/служба не имеет права `IDXGIOutput1::DuplicateOutput`; `stream.cmd` запускается как обычное пользовательское приложение.

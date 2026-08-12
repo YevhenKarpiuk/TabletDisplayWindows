@@ -37,6 +37,7 @@ AddReg=TabletDisplay_HardwareDeviceSettings
 
 [TabletDisplay_HardwareDeviceSettings]
 HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+HKR,,"Security",%REG_SZ%,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;BU)"
 HKR,"WUDF","DeviceGroupId",%REG_SZ%,"TabletDisplayDriverGroup"
 
 [TabletDisplay_Install.NT.Services]

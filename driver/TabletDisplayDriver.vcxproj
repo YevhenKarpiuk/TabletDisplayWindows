@@ -16,6 +16,7 @@
   <ItemGroup>
     <ClInclude Include="include\Driver.h" />
     <ClInclude Include="include\Trace.h" />
+    <ClInclude Include="..\shared\ipc\FrameTransport.h" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="TabletDisplayDriver.inf" />
@@ -70,7 +71,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64' Or '$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <WppEnabled>true</WppEnabled>
       <WppRecorderEnabled>true</WppRecorderEnabled>
       <WppScanConfigurationData>$(ProjectDir)include\Trace.h</WppScanConfigurationData>

@@ -63,6 +63,7 @@
     <ClCompile Include="..\shared\video\VideoProcessing.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\shared\ipc\FrameTransport.h" />
     <ClInclude Include="..\shared\protocol\Protocol.h" />
     <ClInclude Include="..\shared\protocol\ProtocolConstants.h" />
     <ClInclude Include="..\shared\video\SyntheticH264.h" />

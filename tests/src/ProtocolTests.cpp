@@ -1,3 +1,4 @@
+#include "ipc/FrameTransport.h"
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
 #include "video/VideoProcessing.h"
@@ -330,7 +331,15 @@ int main(int argc, char* argv[])
             tabletdisplay::video::AnnexBContainsNalType(parsedConfig.annexB, 8),
             "AVC configuration SPS/PPS");
 
-        std::cout << "TabletDisplay protocol: 13 golden vectors, H.264 and pixel pipeline passed\n";
+        const tabletdisplay::ipc::FrameRequest frameRequest{};
+        const tabletdisplay::ipc::FrameResponseHeader frameHeader{};
+        Check(frameRequest.structureBytes == sizeof(frameRequest), "frame IPC request layout");
+        Check(frameHeader.magic == tabletdisplay::ipc::kFrameMagic &&
+            frameHeader.headerBytes == sizeof(frameHeader), "frame IPC response layout");
+        Check(tabletdisplay::ipc::kMaxFrameBytes == 1920U * 1200U * 4U,
+            "frame IPC byte limit");
+
+        std::cout << "TabletDisplay protocol: 13 golden vectors, H.264, pixel and frame IPC passed\n";
         return 0;
     }
     catch (const std::exception& exception)

@@ -12,9 +12,10 @@ check-driver.cmd
 demo.cmd
 encoder-demo.cmd --seconds 5
 stream.cmd --seconds 10
+virtual-stream.cmd --seconds 10
 ```
 
-`stream.cmd` запускайте из обычного интерактивного пользовательского сеанса Windows: Desktop Duplication намеренно недоступен из service/sandbox. Пока IddCx IPC не подключён, передаётся основной физический дисплей, масштабированный до 1280×800.
+`stream.cmd` передаёт основной физический дисплей через Desktop Duplication. `virtual-stream.cmd` включает режим «Расширить», получает последний BGRA-кадр виртуального монитора через read-only IOCTL драйвера и передаёт его существующим H.264-конвейером. Обе команды запускайте из обычного интерактивного пользовательского сеанса Windows.
 
 `install-driver.cmd Release` собирает, test-sign-подписывает и устанавливает IddCx-пакет с запросом UAC. Для отката используйте `uninstall-driver.cmd`; детали Secure Boot/Test Mode описаны в [doc/BUILD.md](doc/BUILD.md).
 
