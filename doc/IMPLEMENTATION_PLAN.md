@@ -1,5 +1,7 @@
 # План реализации TabletDisplayWindows
 
+> Статус 2026-08-12: окружение, protocol v1, ADB handshake и synthetic H.264 transport проверены сквозным тестом на планшете. Следующий основной шаг — test-sign/install IddCx и прототип Driver/Host IPC.
+
 ## 1. Цель и границы MVP
 
 Сделать Windows-приложение и Indirect Display Driver, которые добавляют в Windows 11 один настоящий расширяемый дисплей и передают его изображение на Android-планшет по USB через ADB.

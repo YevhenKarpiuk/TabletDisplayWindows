@@ -1,4 +1,5 @@
 #include "protocol/Protocol.h"
+#include "video/SyntheticH264.h"
 
 #include <algorithm>
 #include <cctype>
@@ -279,7 +280,16 @@ int main(int argc, char* argv[])
         CheckDirectionStream(directory, cases, "W2A");
         CheckDirectionStream(directory, cases, "A2W");
 
-        std::cout << "TabletDisplay protocol: 13 golden vectors passed\n";
+        const auto synthetic = tabletdisplay::video::BuildSyntheticColorBars();
+        Check(synthetic.width == 1280 && synthetic.height == 800, "synthetic dimensions");
+        Check(synthetic.codecSpecificData.size() >= 16, "synthetic CSD size");
+        Check(synthetic.idrAccessUnit.size() > 3'000, "synthetic IDR size");
+        Check(synthetic.idrAccessUnit.size() <= tabletdisplay::protocol::kMaxAccessUnitSize,
+            "synthetic IDR protocol limit");
+        Check(synthetic.codecSpecificData[4] == 0x67, "synthetic SPS");
+        Check(synthetic.idrAccessUnit[4] == 0x67, "synthetic access unit SPS");
+
+        std::cout << "TabletDisplay protocol: 13 golden vectors and synthetic H.264 passed\n";
         return 0;
     }
     catch (const std::exception& exception)

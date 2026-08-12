@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "protocol/Protocol.h"
+#include "video/SyntheticH264.h"
 
 #include <algorithm>
 #include <array>
@@ -371,7 +372,7 @@ namespace
         };
     }
 
-    [[nodiscard]] Message MakePing(std::uint64_t token)
+    [[nodiscard]] Message MakePing(std::uint64_t sequence, std::uint64_t token)
     {
         std::vector<std::uint8_t> payload;
         payload.reserve(16);
@@ -379,7 +380,59 @@ namespace
         AppendLe(payload, NowUs());
         return {
             { static_cast<std::uint16_t>(MessageType::Ping), Critical,
-              static_cast<std::uint32_t>(payload.size()), 2, NowUs() },
+              static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
+            std::move(payload)
+        };
+    }
+
+    [[nodiscard]] Message MakeVideoConfig(
+        std::uint64_t sequence,
+        const tabletdisplay::video::SyntheticH264& stream)
+    {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(28U + stream.codecSpecificData.size());
+        AppendLe(payload, static_cast<std::uint32_t>(1)); // stream_id.
+        AppendLe(payload, static_cast<std::uint32_t>(1)); // config_id.
+        AppendLe(payload, stream.width);
+        AppendLe(payload, stream.height);
+        AppendLe(payload, stream.fps);
+        AppendLe(payload, static_cast<std::uint16_t>(1));
+        payload.push_back(stream.profileIdc);
+        payload.push_back(stream.levelIdc);
+        AppendLe(payload, static_cast<std::uint16_t>(1)); // ANNEX_B_CSD.
+        AppendLe(payload, static_cast<std::uint32_t>(5'000'000));
+        AppendLe(payload, static_cast<std::uint32_t>(stream.codecSpecificData.size()));
+        payload.insert(
+            payload.end(),
+            stream.codecSpecificData.begin(),
+            stream.codecSpecificData.end());
+        return {
+            { static_cast<std::uint16_t>(MessageType::VideoConfig), Critical,
+              static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
+            std::move(payload)
+        };
+    }
+
+    [[nodiscard]] Message MakeVideoFrame(
+        std::uint64_t sequence,
+        const tabletdisplay::video::SyntheticH264& stream)
+    {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(32U + stream.idrAccessUnit.size());
+        AppendLe(payload, static_cast<std::uint32_t>(1)); // stream_id.
+        AppendLe(payload, static_cast<std::uint32_t>(1)); // config_id.
+        AppendLe(payload, static_cast<std::uint64_t>(1)); // frame_id.
+        AppendLe(payload, static_cast<std::uint64_t>(0)); // PTS relative to stream start.
+        AppendLe(payload, static_cast<std::uint32_t>(stream.idrAccessUnit.size()));
+        AppendLe(payload, static_cast<std::uint32_t>(0));
+        payload.insert(
+            payload.end(),
+            stream.idrAccessUnit.begin(),
+            stream.idrAccessUnit.end());
+        return {
+            { static_cast<std::uint16_t>(MessageType::VideoFrame),
+              static_cast<std::uint16_t>(Critical | KeyFrame | Discontinuity),
+              static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
             std::move(payload)
         };
     }
@@ -389,7 +442,7 @@ namespace
         SendAll(socket, EncodeMessage(message.header, message.payload));
     }
 
-    void PerformHandshake(SOCKET socket)
+    [[nodiscard]] std::uint64_t PerformHandshake(SOCKET socket)
     {
         const auto nonce = RandomNonce();
         SendMessage(socket, MakeHello(nonce));
@@ -435,7 +488,7 @@ namespace
                     if (ReadLe<std::uint64_t>(message.payload, 0) != pingToken)
                         throw std::runtime_error("PONG token mismatch");
                     std::cout << "Protocol handshake and PING/PONG succeeded.\n";
-                    return;
+                    return 3;
                 }
                 else
                 {
@@ -444,10 +497,27 @@ namespace
             }
             if (ackReceived && displayReceived && !pingSent)
             {
-                SendMessage(socket, MakePing(pingToken));
+                SendMessage(socket, MakePing(2, pingToken));
                 pingSent = true;
             }
         }
+    }
+
+    void RunSyntheticDemo(SOCKET socket, std::uint64_t nextSequence)
+    {
+        const auto stream = tabletdisplay::video::BuildSyntheticColorBars();
+        std::cout
+            << "Synthetic H.264: " << stream.width << 'x' << stream.height
+            << ", IDR " << stream.idrAccessUnit.size() << " bytes\n";
+        SendMessage(socket, MakeVideoConfig(nextSequence++, stream));
+        SendMessage(socket, MakeVideoFrame(nextSequence++, stream));
+        std::cout << "Color bars sent; keeping the demo session alive for 6 seconds.\n";
+        for (unsigned second = 0; second < 6; ++second)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            SendMessage(socket, MakePing(nextSequence++, RandomNonce()));
+        }
+        std::cout << "Synthetic video demo completed.\n";
     }
 
     void PrintHelp()
@@ -457,10 +527,11 @@ namespace
             << "Usage:\n"
             << "  TabletDisplayHost --check\n"
             << "  TabletDisplayHost --connect [--serial SERIAL]\n"
+            << "  TabletDisplayHost --demo [--serial SERIAL]\n"
             << "  TabletDisplayHost --version\n";
     }
 
-    int ConnectCommand(const std::string& requestedSerial)
+    int ConnectCommand(const std::string& requestedSerial, bool runDemo)
     {
         const auto adb = FindAdb();
         std::cout << "ADB: " << Narrow(adb.wstring()) << '\n';
@@ -484,7 +555,11 @@ namespace
             }
             WinsockSession winsock;
             auto socket = ConnectLoopback();
-            PerformHandshake(socket.get());
+            const auto nextSequence = PerformHandshake(socket.get());
+            if (runDemo)
+            {
+                RunSyntheticDemo(socket.get(), nextSequence);
+            }
             if (createdForward)
             {
                 const auto result = RunProcess(adb, selector + L"forward --remove tcp:27183");
@@ -515,7 +590,7 @@ int main(int argc, char* argv[])
         }
         if (command == "--version")
         {
-            std::cout << "TabletDisplayHost 0.2.0\n";
+            std::cout << "TabletDisplayHost 0.3.0\n";
             return 0;
         }
         if (command == "--check")
@@ -526,12 +601,12 @@ int main(int argc, char* argv[])
                 << "ADB: " << Narrow(FindAdb().wstring()) << '\n';
             return 0;
         }
-        if (command == "--connect")
+        if (command == "--connect" || command == "--demo")
         {
             std::string serial;
             if (argc == 4 && std::string_view(argv[2]) == "--serial") serial = argv[3];
-            else if (argc != 2) throw std::runtime_error("Expected --connect [--serial SERIAL]");
-            return ConnectCommand(serial);
+            else if (argc != 2) throw std::runtime_error("Expected command [--serial SERIAL]");
+            return ConnectCommand(serial, command == "--demo");
         }
         throw std::runtime_error("Unknown argument");
     }

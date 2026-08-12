@@ -59,10 +59,12 @@
   <ItemGroup>
     <ClCompile Include="src\ProtocolTests.cpp" />
     <ClCompile Include="..\shared\protocol\Protocol.cpp" />
+    <ClCompile Include="..\shared\video\SyntheticH264.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\shared\protocol\Protocol.h" />
     <ClInclude Include="..\shared\protocol\ProtocolConstants.h" />
+    <ClInclude Include="..\shared\video\SyntheticH264.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

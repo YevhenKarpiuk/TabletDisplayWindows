@@ -3,8 +3,8 @@
 ## Зафиксированное окружение
 
 - Windows 11 x64.
-- Visual Studio 2022 с MSVC v143, Windows Driver Kit и Spectre libraries (x64).
-- Windows SDK/WDK `10.0.26100.6584` в `C:\tools\wdk\10.0.26100.6584\packages`.
+- Visual Studio 2022: MSVC v143, Windows Driver Kit, Spectre libraries (x64).
+- Windows SDK/WDK `10.0.26100.6584`: `C:\tools\wdk\10.0.26100.6584\packages`.
 - Целевая SDK: `10.0.26100.0`.
 
 ## Команды
@@ -15,25 +15,20 @@
 build.cmd Debug
 build.cmd Release
 test.cmd
-connect.cmd
+connect.cmd [--serial SERIAL]
+demo.cmd [--serial SERIAL]
 ```
 
-`build.cmd`:
+- `build.cmd` восстанавливает portable WDK/SDK в игнорируемый `packages`, находит x64 MSBuild и собирает solution без подписи драйвера.
+- `test.cmd` собирает Debug x64 и запускает parser/golden tests и проверку встроенного H.264 fixture.
+- `connect.cmd` выбирает ADB-устройство, создаёт только недостающий forward и выполняет handshake + PING/PONG.
+- `demo.cmd` дополнительно отправляет `VIDEO_CONFIG` и один 1280×800 AVC Baseline IDR с SMPTE-полосами, затем держит heartbeat 6 секунд.
 
-1. распаковывает три portable NuGet-пакета в игнорируемый каталог `packages`;
-2. находит установленный x64 MSBuild через `vswhere`;
-3. добавляет WDK/SDK tools только в окружение дочернего процесса;
-4. собирает `TabletDisplayWindows.sln` для x64 без подписи драйвера.
+Артефакты: `artifacts\x64\<Configuration>`.
 
-`test.cmd` собирает Debug x64 и запускает проверку C++ parser по общим golden-векторам из `protocol\golden`.
+## Текущее состояние
 
-`connect.cmd [--serial SERIAL]` находит `adb`, требует ровно одно готовое устройство (либо указанный serial), создаёт недостающий port forward и выполняет `HELLO/HELLO_ACK/DISPLAY_INFO/PING/PONG`. Чужой ранее существовавший forward не удаляется; созданный host-процессом удаляется при выходе.
-
-Артефакты находятся в `artifacts\x64\<Configuration>`.
-
-## Ограничения каркаса
-
-- `TabletDisplayDriver` — рабочая IddCx-база из официального Microsoft IddSample, ограниченная одним монитором; production IPC пока не реализован.
-- `TabletDisplayHost` выполняет выбор ADB-устройства, port forward, TCP connect и handshake; автоматический reconnect, Media Foundation и IPC появятся на следующих этапах.
-- Строгий incremental parser wire-протокола подключён к тестовому transport host.
-- INF и CAT создаются, но пакет не подписывается. Для установки нужна отдельно настроенная тестовая подпись и системный режим test-signing.
+- `TabletDisplayDriver` — собираемая IddCx-база Microsoft IddSample для одного монитора; production IPC ещё не реализован.
+- `TabletDisplayHost` — ADB/TCP/session controller и сквозной synthetic H.264 demo; Media Foundation encoder и automatic reconnect ещё не реализованы.
+- Synthetic fixture сгенерирован/проверен portable FFmpeg 9.0.1 из `C:\tools\ffmpeg`, но FFmpeg не является runtime-зависимостью.
+- INF/CAT создаются без ошибок; для установки драйвера нужна test-signing конфигурация.

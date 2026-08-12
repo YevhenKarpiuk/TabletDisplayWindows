@@ -33,6 +33,13 @@
       "problemMatcher": []
     },
     {
+      "label": "run: synthetic video demo",
+      "type": "process",
+      "command": "${workspaceFolder}\\demo.cmd",
+      "dependsOn": "build: debug x64",
+      "problemMatcher": []
+    },
+    {
       "label": "test: protocol",
       "type": "process",
       "command": "${workspaceFolder}\\test.cmd",

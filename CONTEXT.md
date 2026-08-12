@@ -1,16 +1,15 @@
 # TabletDisplayWindows
 
-Windows-часть системы, превращающей Android-планшет в дополнительный монитор Windows 11 по USB.
+Windows-часть системы, превращающей Android-планшет в дополнительный монитор Windows 11 по USB/ADB.
 
 - Парный проект: `C:\Users\ka\Documents\kotlin\TabletDisplayAndroid`.
-- Назначение: создать виртуальный дисплей, получить его кадры, закодировать их в H.264 и передать Android-приложению; принять touch и преобразовать его во ввод Windows.
-- MVP: Windows 11 x64, один дисплей, 1280×800 и 1920×1200, 30/60 Гц, H.264, одно USB-подключение через ADB.
-- Стек: C++20, UMDF 2, IddCx, D3D11, Media Foundation, Windows SDK/WDK, MSBuild, VS Code, ADB.
-- WDK: в VS 2022 установлены Windows Driver Kit component и MSVC Spectre x64 libraries; portable NuGet WDK/SDK 10.0.26100.6584 находится в `C:\tools\wdk\10.0.26100.6584`. Microsoft IddSample `Debug|x64` успешно собран через x64 MSBuild; INF/CAT проверены, тестовая подпись ещё не настроена.
-- Компоненты: `TabletDisplayDriver.dll` (виртуальный монитор и swap chain) и `TabletDisplayHost.exe` (кодирование, транспорт, управление и ввод).
-- Транспорт MVP: Android слушает TCP `27183`; Windows выполняет `adb forward tcp:27183 tcp:27183` и подключается к `127.0.0.1:27183`.
-- Контракт с Android: версионированный бинарный протокол; эталонная спецификация должна храниться в `doc/PROTOCOL.md` и синхронно отражаться в обоих проектах.
-- Главный риск: надёжная и быстрая передача кадров из UMDF/IddCx в отдельный host-процесс; сначала нужен изолированный прототип IPC.
-- План: [doc/IMPLEMENTATION_PLAN.md](doc/IMPLEMENTATION_PLAN.md).
-
-Статус: wire-протокол v1 и parser покрыты golden-тестами. Host выбирает ADB-устройство, настраивает forward и выполняет TCP handshake + PING/PONG; проверено на Lenovo TB-X606F (1920×1200@60). Потоковое видео, IPC и ввод ещё не подключены.
+- MVP: один виртуальный дисплей 1280×800/1920×1200, 30/60 Гц, H.264, touch → мышь.
+- Стек: C++20, UMDF 2/IddCx, D3D11, Media Foundation, Winsock, MSBuild/WDK.
+- Транспорт: `adb forward tcp:27183 tcp:27183`, затем бинарный protocol v1 из `doc/PROTOCOL.md`.
+- Инструменты: VS 2022 + WDK/Spectre; portable WDK 10.0.26100.6584 в `C:\tools\wdk`; ADB в `C:\tools\android\sdk`.
+- Сборка/тест: `build.cmd Debug|Release`, `test.cmd`; demo: `demo.cmd [--serial SERIAL]`.
+- Готово: IddCx-каркас собирается; parser/golden tests; ADB handshake/PING; synthetic AVC Baseline sender.
+- Проверено на Lenovo TB-X606F: host → ADB/TCP → аппаратный MediaCodec → Surface, 1280×800; PixelCopy подтвердил 53 цвета тестового кадра.
+- Portable FFmpeg 9.0.1: `C:\tools\ffmpeg`; нужен только для генерации/проверки fixtures, не для запуска host.
+- Далее: test-sign/install драйвера, реальный виртуальный монитор, Driver/Host IPC, Media Foundation encoder, reconnect и touch.
+- Подробный план: [doc/IMPLEMENTATION_PLAN.md](doc/IMPLEMENTATION_PLAN.md).
