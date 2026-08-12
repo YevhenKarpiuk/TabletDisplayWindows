@@ -13,6 +13,10 @@ $certificateDir = Join-Path $projectRoot "artifacts\cert"
 $certificatePath = Join-Path $certificateDir "TabletDisplayDriverTest.cer"
 $signTool = Join-Path $projectRoot "packages\Microsoft.Windows.SDK.CPP.10.0.26100.6584\c\bin\10.0.26100.0\x64\signtool.exe"
 $certificateSubject = "CN=TabletDisplay Driver Test Certificate"
+$hostPaths = @(
+    (Join-Path $projectRoot "artifacts\x64\$Configuration\host\TabletDisplay.exe"),
+    (Join-Path $projectRoot "artifacts\x64\$Configuration\host\TabletDisplayHost.exe")
+)
 
 if (-not (Test-Path -LiteralPath $catalogPath)) {
     throw "Driver catalog not found. Run build.cmd $Configuration first."
@@ -50,6 +54,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "SignTool failed with exit code $LASTEXITCODE."
 }
 
+foreach ($hostPath in $hostPaths) {
+    if (-not (Test-Path -LiteralPath $hostPath)) { throw "Host executable not found: $hostPath" }
+    & $signTool sign /v /fd SHA256 /sha1 $certificate.Thumbprint /s My $hostPath
+    if ($LASTEXITCODE -ne 0) { throw "SignTool failed for $hostPath with exit code $LASTEXITCODE." }
+}
+
 $signature = Get-AuthenticodeSignature -LiteralPath $catalogPath
 if ($null -eq $signature.SignerCertificate -or
     $signature.SignerCertificate.Thumbprint -ne $certificate.Thumbprint) {
@@ -59,3 +69,4 @@ if ($null -eq $signature.SignerCertificate -or
 Write-Output "Signed catalog: $catalogPath"
 Write-Output "Certificate: $certificatePath"
 Write-Output "Thumbprint: $($certificate.Thumbprint)"
+Write-Output "Signed host executables: $($hostPaths -join ', ')"

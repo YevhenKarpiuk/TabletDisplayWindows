@@ -6,6 +6,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TabletDisplayDriver", "driv
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TabletDisplayHost", "host\TabletDisplayHost.vcxproj", "{00D9D0E0-FCF9-4F8B-A2C6-BE62ECDFE9E2}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TabletDisplayTray", "host-tray\TabletDisplayTray.vcxproj", "{4186F2AF-C480-4090-8A0B-61E39D98E22C}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TabletDisplayProtocolTests", "tests\TabletDisplayProtocolTests.vcxproj", "{D78CDE9C-AD80-478C-9304-357DF8A4A8E0}"
 EndProject
 Global
@@ -22,6 +24,10 @@ Global
 		{00D9D0E0-FCF9-4F8B-A2C6-BE62ECDFE9E2}.Debug|x64.Build.0 = Debug|x64
 		{00D9D0E0-FCF9-4F8B-A2C6-BE62ECDFE9E2}.Release|x64.ActiveCfg = Release|x64
 		{00D9D0E0-FCF9-4F8B-A2C6-BE62ECDFE9E2}.Release|x64.Build.0 = Release|x64
+		{4186F2AF-C480-4090-8A0B-61E39D98E22C}.Debug|x64.ActiveCfg = Debug|x64
+		{4186F2AF-C480-4090-8A0B-61E39D98E22C}.Debug|x64.Build.0 = Debug|x64
+		{4186F2AF-C480-4090-8A0B-61E39D98E22C}.Release|x64.ActiveCfg = Release|x64
+		{4186F2AF-C480-4090-8A0B-61E39D98E22C}.Release|x64.Build.0 = Release|x64
 		{D78CDE9C-AD80-478C-9304-357DF8A4A8E0}.Debug|x64.ActiveCfg = Debug|x64
 		{D78CDE9C-AD80-478C-9304-357DF8A4A8E0}.Debug|x64.Build.0 = Debug|x64
 		{D78CDE9C-AD80-478C-9304-357DF8A4A8E0}.Release|x64.ActiveCfg = Release|x64

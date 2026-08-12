@@ -2,6 +2,7 @@
 .vscode/*.log
 packages/
 artifacts/
+dist/
 [Bb]in/
 [Oo]bj/
 *.user
