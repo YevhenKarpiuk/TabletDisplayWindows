@@ -1,10 +1,12 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <dbt.h>
 #include <shellapi.h>
 
 #include "../resource.h"
 
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -19,11 +21,16 @@ namespace
     constexpr wchar_t kMutexName[] = L"Local\\TabletDisplayTray-48B668E5-4AE8-4A35-A64F-328827B7ABDA";
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValueName[] = L"TabletDisplay";
+    constexpr GUID kSessionDisplayStatus{
+        0x2b84c20e, 0xad23, 0x4ddf, { 0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5 }
+    };
 
     NOTIFYICONDATAW g_trayIcon{};
     PROCESS_INFORMATION g_hostProcess{};
     HANDLE g_instanceMutex{};
+    HPOWERNOTIFY g_displayPowerNotification{};
     bool g_exiting{};
+    bool g_displayPoweredOn{ true };
     UINT g_taskbarCreated{};
 
     std::filesystem::path ExecutablePath()
@@ -243,12 +250,16 @@ namespace
         switch (message)
         {
         case WM_CREATE:
+            g_displayPowerNotification = RegisterPowerSettingNotification(
+                window,
+                &kSessionDisplayStatus,
+                DEVICE_NOTIFY_WINDOW_HANDLE);
             AddTrayIcon(window);
             (void)SetTimer(window, kProcessTimer, 2'000, nullptr);
             (void)StartHost(window);
             return 0;
         case WM_TIMER:
-            if (wParam == kProcessTimer && !g_exiting)
+            if (wParam == kProcessTimer && !g_exiting && g_displayPoweredOn)
             {
                 if (!g_hostProcess.hProcess ||
                     WaitForSingleObject(g_hostProcess.hProcess, 0) == WAIT_OBJECT_0)
@@ -258,6 +269,28 @@ namespace
                 }
             }
             return 0;
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_POWERSETTINGCHANGE && lParam != 0)
+            {
+                const auto* setting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
+                if (IsEqualGUID(setting->PowerSetting, kSessionDisplayStatus) &&
+                    setting->DataLength >= sizeof(DWORD))
+                {
+                    DWORD displayState{};
+                    std::memcpy(&displayState, setting->Data, sizeof(displayState));
+                    const auto poweredOn = displayState != 0;
+                    if (poweredOn != g_displayPoweredOn)
+                    {
+                        g_displayPoweredOn = poweredOn;
+                        if (poweredOn)
+                            (void)StartHost(window);
+                        else
+                            StopHost();
+                    }
+                }
+                return TRUE;
+            }
+            break;
         case kTrayMessage:
             if (LOWORD(lParam) == WM_LBUTTONUP || LOWORD(lParam) == WM_RBUTTONUP ||
                 LOWORD(lParam) == WM_CONTEXTMENU)
@@ -295,6 +328,11 @@ namespace
         case WM_DESTROY:
             g_exiting = true;
             (void)KillTimer(window, kProcessTimer);
+            if (g_displayPowerNotification)
+            {
+                (void)UnregisterPowerSettingNotification(g_displayPowerNotification);
+                g_displayPowerNotification = nullptr;
+            }
             (void)Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
             if (g_trayIcon.hIcon) DestroyIcon(g_trayIcon.hIcon);
             StopHost();
