@@ -51,7 +51,7 @@ virtual-stream.cmd [--serial SERIAL] [--seconds N]
 ## Текущее состояние
 
 - Driver — IddCx-база Microsoft IddSample; swap-chain копируется в latest-frame BGRA store и выдаётся Host через read-only IOCTL.
-- Host 0.5.0 — ADB/session, DXGI/IddCx capture, CPU NV12 conversion, Media Foundation H.264 и protocol sender.
+- Host 0.1.1 — ADB/session, DXGI/IddCx capture, CPU NV12 conversion, Media Foundation H.264 и protocol sender.
 - Software H264 MFT проверен FFmpeg (Constrained Baseline 1280×800) и планшетом: 150/150 кадров, аппаратный MTK decoder.
 - Intel Quick Sync MFT обнаружен; hardware output будет активирован с прямым GPU frame path от IddCx.
 - Песочница/служба не имеет права `IDXGIOutput1::DuplicateOutput`; `stream.cmd` запускается как обычное пользовательское приложение.

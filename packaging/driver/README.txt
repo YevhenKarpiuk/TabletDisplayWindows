@@ -1,4 +1,4 @@
-TabletDisplay Driver 0.1.0
+TabletDisplay Driver 0.1.1
 
 UK
 1. Розпакуйте ZIP повністю.
