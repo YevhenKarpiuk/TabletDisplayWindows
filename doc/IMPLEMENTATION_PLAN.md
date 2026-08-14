@@ -1,6 +1,6 @@
 # План реализации TabletDisplayWindows
 
-> Статус 2026-08-14: реализован полный GPU-путь driver→Host→Quick Sync: именованная D3D11 BGRA-текстура с keyed mutex, GPU-поворот/BGRA→NV12 и передача NV12 в encoder без CPU-копии. CPU IOCTL fallback и автоматический возврат после падения Host сохранены. На `HA15VXDN` пройдены 60-секундный soak (~112,5 МБ private), штатный и аварийный fallback. Следующий шаг — 60-минутный soak/reconnect и новый release.
+> Статус 2026-08-14: реализован полный GPU-путь driver→Host→Quick Sync, CPU IOCTL fallback и автоматическое восстановление после падения Host. Tray поддерживает локализованный переключатель автозапуска через HKCU. На `HA15VXDN` пройдены 60-секундный soak (~112,5 МБ private), штатный и аварийный fallback. Следующий шаг — 60-минутный soak/reconnect.
 
 ## 1. Цель и границы MVP
 

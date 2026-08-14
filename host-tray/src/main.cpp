@@ -14,8 +14,11 @@ namespace
     constexpr UINT kTrayMessage = WM_APP + 1;
     constexpr UINT_PTR kProcessTimer = 1;
     constexpr UINT kExitCommand = 1001;
+    constexpr UINT kAutoStartCommand = 1002;
     constexpr wchar_t kWindowClass[] = L"TabletDisplayTrayWindow";
     constexpr wchar_t kMutexName[] = L"Local\\TabletDisplayTray-48B668E5-4AE8-4A35-A64F-328827B7ABDA";
+    constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    constexpr wchar_t kRunValueName[] = L"TabletDisplay";
 
     NOTIFYICONDATAW g_trayIcon{};
     PROCESS_INFORMATION g_hostProcess{};
@@ -23,12 +26,86 @@ namespace
     bool g_exiting{};
     UINT g_taskbarCreated{};
 
-    std::filesystem::path ExecutableDirectory()
+    std::filesystem::path ExecutablePath()
     {
         std::vector<wchar_t> buffer(32'768);
         const auto length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
         if (length == 0 || length >= buffer.size()) return {};
-        return std::filesystem::path(std::wstring(buffer.data(), length)).parent_path();
+        return std::filesystem::path(std::wstring(buffer.data(), length));
+    }
+
+    std::filesystem::path ExecutableDirectory()
+    {
+        return ExecutablePath().parent_path();
+    }
+
+    bool IsUkrainianUi() noexcept
+    {
+        return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_UKRAINIAN;
+    }
+
+    std::wstring AutoStartCommand()
+    {
+        const auto path = ExecutablePath();
+        return path.empty() ? std::wstring{} : L"\"" + path.wstring() + L"\"";
+    }
+
+    bool IsAutoStartEnabled()
+    {
+        std::vector<wchar_t> value(32'768);
+        DWORD valueBytes = static_cast<DWORD>(value.size() * sizeof(wchar_t));
+        const auto result = RegGetValueW(
+            HKEY_CURRENT_USER,
+            kRunKey,
+            kRunValueName,
+            RRF_RT_REG_SZ,
+            nullptr,
+            value.data(),
+            &valueBytes);
+        if (result != ERROR_SUCCESS) return false;
+        const auto expected = AutoStartCommand();
+        return !expected.empty() && _wcsicmp(value.data(), expected.c_str()) == 0;
+    }
+
+    bool SetAutoStartEnabled(bool enabled)
+    {
+        HKEY key{};
+        const auto openResult = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            kRunKey,
+            0,
+            nullptr,
+            REG_OPTION_NON_VOLATILE,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
+            nullptr,
+            &key,
+            nullptr);
+        if (openResult != ERROR_SUCCESS) return false;
+
+        LONG result{};
+        if (enabled)
+        {
+            const auto command = AutoStartCommand();
+            if (command.empty())
+            {
+                RegCloseKey(key);
+                return false;
+            }
+            result = RegSetValueExW(
+                key,
+                kRunValueName,
+                0,
+                REG_SZ,
+                reinterpret_cast<const BYTE*>(command.c_str()),
+                static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+        }
+        else
+        {
+            result = RegDeleteValueW(key, kRunValueName);
+            if (result == ERROR_FILE_NOT_FOUND) result = ERROR_SUCCESS;
+        }
+        RegCloseKey(key);
+        return result == ERROR_SUCCESS;
     }
 
     void ReleaseTabletMouseButton() noexcept
@@ -139,9 +216,13 @@ namespace
     {
         const auto menu = CreatePopupMenu();
         if (!menu) return;
-        const auto exitText = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_UKRAINIAN
-            ? L"\u0412\u0438\u0445\u0456\u0434"
-            : L"Exit";
+        const auto ukrainian = IsUkrainianUi();
+        const auto autoStartText = ukrainian ? L"\u0410\u0432\u0442\u043e\u0437\u0430\u043f\u0443\u0441\u043a \u0456\u0437 Windows" : L"Start with Windows";
+        const auto exitText = ukrainian ? L"\u0412\u0438\u0445\u0456\u0434" : L"Exit";
+        const auto autoStartFlags = MF_STRING |
+            (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
+        (void)AppendMenuW(menu, autoStartFlags, kAutoStartCommand, autoStartText);
+        (void)AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         (void)AppendMenuW(menu, MF_STRING, kExitCommand, exitText);
         POINT point{};
         (void)GetCursorPos(&point);
@@ -185,6 +266,21 @@ namespace
             }
             return 0;
         case WM_COMMAND:
+            if (LOWORD(wParam) == kAutoStartCommand)
+            {
+                const auto enable = !IsAutoStartEnabled();
+                if (!SetAutoStartEnabled(enable))
+                {
+                    MessageBoxW(
+                        window,
+                        IsUkrainianUi()
+                            ? L"\u041d\u0435 \u0432\u0434\u0430\u043b\u043e\u0441\u044f \u0437\u043c\u0456\u043d\u0438\u0442\u0438 \u043d\u0430\u043b\u0430\u0448\u0442\u0443\u0432\u0430\u043d\u043d\u044f \u0430\u0432\u0442\u043e\u0437\u0430\u043f\u0443\u0441\u043a\u0443."
+                            : L"Could not change the autostart setting.",
+                        L"TabletDisplay",
+                        MB_OK | MB_ICONERROR);
+                }
+                return 0;
+            }
             if (LOWORD(wParam) == kExitCommand)
             {
                 DestroyWindow(window);
