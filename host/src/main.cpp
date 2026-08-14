@@ -902,13 +902,51 @@ namespace
             throw std::runtime_error(
                 "IddCx frame size does not match the Windows display orientation");
         }
+        tabletdisplay::host::SharedCapturedFrame sharedProbe{};
+        bool sharedTransport = capture.ProbeShared(sharedProbe, 500) &&
+            sharedProbe.width == rawWidth && sharedProbe.height == rawHeight;
         tabletdisplay::host::MediaFoundationH264Encoder encoder({
-            width, height, fps, bitrate, true });
+            width,
+            height,
+            fps,
+            bitrate,
+            true,
+            sharedTransport ? sharedProbe.adapterLuid : 0 });
+        tabletdisplay::host::SharedCapturedFrame initialSharedFrame{};
+        if (sharedTransport && encoder.IsHardware())
+        {
+            try
+            {
+                encoder.PrepareSharedBgra(
+                    sharedProbe.resourceName,
+                    sharedProbe.generation,
+                    sharedProbe.width,
+                    sharedProbe.height,
+                    orientation);
+                capture.SetSharedTransport(true, sharedProbe.generation);
+                if (!capture.CaptureShared(initialSharedFrame, 500))
+                    throw std::runtime_error("No initial shared D3D11 frame is available");
+            }
+            catch (const std::exception& exception)
+            {
+                if (capture.UsesSharedTransport()) capture.SetSharedTransport(false);
+                sharedTransport = false;
+                std::cerr << "Shared D3D11 transport unavailable: " << exception.what()
+                    << "; using CPU frame IPC fallback.\n";
+            }
+        }
+        else
+        {
+            sharedTransport = false;
+        }
         std::cout
             << "IddCx capture: virtual display -> " << width << 'x' << height
             << " @ " << fps << " FPS\n"
             << "Media Foundation encoder: " << encoder.Name()
-            << (encoder.IsHardware() ? " (hardware)" : " (software fallback)") << '\n';
+            << (encoder.IsHardware() ? " (hardware)" : " (software fallback)") << '\n'
+            << "Driver/Host frame transport: "
+            << (sharedTransport ? "shared D3D11 texture (zero-copy)" : "CPU BGRA IOCTL fallback")
+            << '\n';
 
         const auto displayBounds = FindTabletDisplayBounds();
         const DWORD receiveTimeoutMs = 250;
@@ -1026,6 +1064,8 @@ namespace
             std::condition_variable ready;
             std::condition_variable empty;
             tabletdisplay::host::CapturedFrame frame;
+            tabletdisplay::host::SharedCapturedFrame sharedFrame;
+            bool newSharedFrame{};
             bool occupied{};
             bool finished{};
             bool stop{};
@@ -1046,6 +1086,7 @@ namespace
             try
             {
                 auto prepared = std::move(frame);
+                auto preparedShared = initialSharedFrame;
                 auto nextCaptureTime = streamStarted;
                 for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
                 {
@@ -1071,7 +1112,18 @@ namespace
                     if (frameIndex != 0)
                     {
                         const auto captureStarted = Clock::now();
-                        if (capture.Capture(prepared, 0))
+                        if (sharedTransport)
+                        {
+                            slot.newSharedFrame = capture.CaptureShared(preparedShared, 0);
+                            if (slot.newSharedFrame &&
+                                (preparedShared.width != rawWidth ||
+                                 preparedShared.height != rawHeight))
+                            {
+                                throw std::runtime_error(
+                                    "The shared virtual display mode changed during streaming");
+                            }
+                        }
+                        else if (capture.Capture(prepared, 0))
                         {
                             if (prepared.width != rawWidth || prepared.height != rawHeight)
                             {
@@ -1080,6 +1132,10 @@ namespace
                             }
                         }
                         captureTime += Clock::now() - captureStarted;
+                    }
+                    else
+                    {
+                        slot.newSharedFrame = sharedTransport;
                     }
                     maximumProducerWork = std::max(
                         maximumProducerWork,
@@ -1090,6 +1146,7 @@ namespace
                         std::lock_guard lock(slot.mutex);
                         if (slot.stop) return;
                         slot.frame = prepared;
+                        slot.sharedFrame = preparedShared;
                         slot.occupied = true;
                     }
                     slot.ready.notify_one();
@@ -1109,6 +1166,9 @@ namespace
         });
 
         tabletdisplay::host::CapturedFrame bgraFrame;
+        tabletdisplay::host::SharedCapturedFrame sharedFrame;
+        bool newSharedFrame{};
+        auto activeSharedGeneration = initialSharedFrame.generation;
         std::uint64_t submittedFrames{};
         bool conversionReported{};
         try
@@ -1125,19 +1185,46 @@ namespace
                     if (slot.failure) std::rethrow_exception(slot.failure);
                     if (!slot.occupied) break;
                     bgraFrame = slot.frame;
+                    sharedFrame = slot.sharedFrame;
+                    newSharedFrame = slot.newSharedFrame;
                 }
 
                 const auto consumerWorkStarted = Clock::now();
                 const auto ptsUs = frameIndex * 1'000'000ULL / fps;
                 const auto encodingStarted = Clock::now();
-                const auto encodedFrames = encoder.EncodeBgra(
-                    bgraFrame.bgra,
-                    bgraFrame.width,
-                    bgraFrame.height,
-                    bgraFrame.stride,
-                    orientation,
-                    ptsUs,
-                    frameIndex == 0 || forceKeyFrame.exchange(false));
+                const auto requestKeyFrame =
+                    frameIndex == 0 || forceKeyFrame.exchange(false);
+                if (sharedTransport && newSharedFrame &&
+                    sharedFrame.generation != activeSharedGeneration)
+                {
+                    encoder.PrepareSharedBgra(
+                        sharedFrame.resourceName,
+                        sharedFrame.generation,
+                        sharedFrame.width,
+                        sharedFrame.height,
+                        orientation);
+                    capture.SetSharedTransport(true, sharedFrame.generation);
+                    activeSharedGeneration = sharedFrame.generation;
+                }
+                const auto encodedFrames = sharedTransport
+                    ? (newSharedFrame
+                        ? encoder.EncodeSharedBgra(
+                            sharedFrame.resourceName,
+                            sharedFrame.generation,
+                            sharedFrame.width,
+                            sharedFrame.height,
+                            orientation,
+                            ptsUs,
+                            requestKeyFrame)
+                        : encoder.EncodeRepeatedFrame(ptsUs, requestKeyFrame))
+                    : encoder.EncodeBgra(
+                        bgraFrame.bgra,
+                        bgraFrame.width,
+                        bgraFrame.height,
+                        bgraFrame.stride,
+                        orientation,
+                        ptsUs,
+                        requestKeyFrame);
                 encodingTime += Clock::now() - encodingStarted;
                 {
                     std::lock_guard lock(slot.mutex);

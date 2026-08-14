@@ -18,6 +18,8 @@ Environment:
 #include "Driver.h"
 #include "Driver.tmh"
 
+#include <bcrypt.h>
+
 using namespace std;
 using namespace Microsoft::IndirectDisp;
 using namespace Microsoft::WRL;
@@ -340,9 +342,292 @@ HRESULT Direct3DDevice::Init()
 
 #pragma region FrameStore
 
+namespace
+{
+    constexpr UINT64 SharedTransportHeartbeatTimeoutMs = 2'000;
+
+    bool MakeSharedResourceName(wchar_t* destination, size_t destinationChars)
+    {
+        if (destination == nullptr || destinationChars == 0)
+        {
+            return false;
+        }
+        BYTE randomBytes[16] = {};
+        if (!BCRYPT_SUCCESS(BCryptGenRandom(
+                nullptr,
+                randomBytes,
+                sizeof(randomBytes),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        {
+            return false;
+        }
+        const int count = swprintf_s(
+            destination,
+            destinationChars,
+            L"Global\\TabletDisplayFrame-%08X-%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+            GetCurrentProcessId(),
+            randomBytes[0], randomBytes[1], randomBytes[2], randomBytes[3],
+            randomBytes[4], randomBytes[5], randomBytes[6], randomBytes[7],
+            randomBytes[8], randomBytes[9], randomBytes[10], randomBytes[11],
+            randomBytes[12], randomBytes[13], randomBytes[14], randomBytes[15]);
+        return count > 0 && static_cast<size_t>(count) < destinationChars;
+    }
+}
+
 FrameStore::FrameStore()
 {
     InitializeSRWLock(&m_Lock);
+}
+
+FrameStore::~FrameStore()
+{
+    AcquireSRWLockExclusive(&m_Lock);
+    ResetSharedTextureLocked();
+    ReleaseSRWLockExclusive(&m_Lock);
+}
+
+void FrameStore::ResetSharedTextureLocked()
+{
+    m_SharedEnabled = false;
+    m_SharedHeartbeatMs = 0;
+    m_SharedFrame = {};
+    m_SharedMutex.Reset();
+    m_SharedTexture.Reset();
+    m_SharedDevice.Reset();
+    if (m_SharedHandle != nullptr)
+    {
+        CloseHandle(m_SharedHandle);
+        m_SharedHandle = nullptr;
+    }
+}
+
+bool FrameStore::CreateSharedTextureLocked(
+    ID3D11Device* device,
+    const D3D11_TEXTURE2D_DESC& sourceDescription)
+{
+    ResetSharedTextureLocked();
+    if (device == nullptr || sourceDescription.Width == 0 || sourceDescription.Height == 0)
+    {
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC description = {};
+    description.Width = sourceDescription.Width;
+    description.Height = sourceDescription.Height;
+    description.MipLevels = 1;
+    description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.MiscFlags =
+        D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+        D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(device->CreateTexture2D(&description, nullptr, &texture)))
+    {
+        return false;
+    }
+    ComPtr<IDXGIKeyedMutex> mutex;
+    ComPtr<IDXGIResource1> resource;
+    if (FAILED(texture.As(&mutex)) || FAILED(texture.As(&resource)))
+    {
+        return false;
+    }
+
+    wchar_t resourceName[tabletdisplay::ipc::kSharedResourceNameChars] = {};
+    if (!MakeSharedResourceName(resourceName, ARRAYSIZE(resourceName)))
+    {
+        return false;
+    }
+
+    SECURITY_DESCRIPTOR securityDescriptor = {};
+    if (!InitializeSecurityDescriptor(&securityDescriptor, SECURITY_DESCRIPTOR_REVISION) ||
+        !SetSecurityDescriptorDacl(&securityDescriptor, TRUE, nullptr, FALSE))
+    {
+        return false;
+    }
+    SECURITY_ATTRIBUTES securityAttributes = {};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    securityAttributes.lpSecurityDescriptor = &securityDescriptor;
+
+    HANDLE sharedHandle = nullptr;
+    if (FAILED(resource->CreateSharedHandle(
+            &securityAttributes,
+            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+            resourceName,
+            &sharedHandle)))
+    {
+        return false;
+    }
+
+    DXGI_ADAPTER_DESC adapterDescription = {};
+    ComPtr<IDXGIDevice> dxgiDevice;
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice))) ||
+        FAILED(dxgiDevice->GetAdapter(&adapter)) ||
+        FAILED(adapter->GetDesc(&adapterDescription)))
+    {
+        CloseHandle(sharedHandle);
+        return false;
+    }
+
+    ++m_SharedGeneration;
+    if (m_SharedGeneration == 0)
+    {
+        ++m_SharedGeneration;
+    }
+    m_SharedFrame = {};
+    m_SharedFrame.magic = tabletdisplay::ipc::kSharedFrameMagic;
+    m_SharedFrame.versionMajor = tabletdisplay::ipc::kFrameVersionMajor;
+    m_SharedFrame.versionMinor = tabletdisplay::ipc::kFrameVersionMinor;
+    m_SharedFrame.structureBytes = sizeof(m_SharedFrame);
+    m_SharedFrame.pixelFormat = tabletdisplay::ipc::kPixelFormatBgra8;
+    m_SharedFrame.width = description.Width;
+    m_SharedFrame.height = description.Height;
+    m_SharedFrame.adapterLuidLow = adapterDescription.AdapterLuid.LowPart;
+    m_SharedFrame.adapterLuidHigh = adapterDescription.AdapterLuid.HighPart;
+    m_SharedFrame.generation = m_SharedGeneration;
+    m_SharedFrame.resourceNameLength = static_cast<UINT>(wcslen(resourceName));
+    wcscpy_s(m_SharedFrame.resourceName, resourceName);
+    m_SharedDevice = device;
+    m_SharedTexture = std::move(texture);
+    m_SharedMutex = std::move(mutex);
+    m_SharedHandle = sharedHandle;
+    return true;
+}
+
+bool FrameStore::PublishShared(
+    ID3D11Device* device,
+    ID3D11DeviceContext* context,
+    ID3D11Texture2D* source,
+    const D3D11_TEXTURE2D_DESC& sourceDescription,
+    UINT64 timestampUs,
+    bool* sharedOnly)
+{
+    if (sharedOnly == nullptr)
+    {
+        return false;
+    }
+    *sharedOnly = false;
+    if (device == nullptr || context == nullptr || source == nullptr ||
+        (sourceDescription.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+         sourceDescription.Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
+    {
+        return false;
+    }
+
+    AcquireSRWLockExclusive(&m_Lock);
+    D3D11_TEXTURE2D_DESC sharedDescription = {};
+    if (m_SharedTexture)
+    {
+        m_SharedTexture->GetDesc(&sharedDescription);
+    }
+    if (!m_SharedTexture || m_SharedDevice.Get() != device ||
+        sharedDescription.Width != sourceDescription.Width ||
+        sharedDescription.Height != sourceDescription.Height)
+    {
+        if (!CreateSharedTextureLocked(device, sourceDescription))
+        {
+            ReleaseSRWLockExclusive(&m_Lock);
+            return false;
+        }
+    }
+
+    const UINT64 nowMs = GetTickCount64();
+    if (m_SharedEnabled &&
+        (m_SharedHeartbeatMs == 0 || nowMs - m_SharedHeartbeatMs > SharedTransportHeartbeatTimeoutMs))
+    {
+        m_SharedEnabled = false;
+    }
+    *sharedOnly = m_SharedEnabled;
+
+    const HRESULT acquireResult = m_SharedMutex->AcquireSync(0, 0);
+    if (acquireResult == WAIT_TIMEOUT)
+    {
+        ReleaseSRWLockExclusive(&m_Lock);
+        return true;
+    }
+    if (FAILED(acquireResult))
+    {
+        ResetSharedTextureLocked();
+        *sharedOnly = false;
+        ReleaseSRWLockExclusive(&m_Lock);
+        return false;
+    }
+
+    context->CopyResource(m_SharedTexture.Get(), source);
+    context->Flush();
+    const HRESULT releaseResult = m_SharedMutex->ReleaseSync(1);
+    if (FAILED(releaseResult))
+    {
+        ResetSharedTextureLocked();
+        *sharedOnly = false;
+        ReleaseSRWLockExclusive(&m_Lock);
+        return false;
+    }
+    ++m_SharedFrame.sequence;
+    m_SharedFrame.timestampUs = timestampUs;
+    ReleaseSRWLockExclusive(&m_Lock);
+    return true;
+}
+
+NTSTATUS FrameStore::CopyShared(
+    UINT64 afterSequence,
+    UINT64 afterGeneration,
+    void* output,
+    size_t outputBytes,
+    size_t* bytesWritten)
+{
+    if (bytesWritten == nullptr)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *bytesWritten = 0;
+    if (output == nullptr || outputBytes < sizeof(m_SharedFrame))
+    {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    AcquireSRWLockExclusive(&m_Lock);
+    if (m_SharedEnabled)
+    {
+        m_SharedHeartbeatMs = GetTickCount64();
+    }
+    if (!m_SharedTexture || m_SharedFrame.sequence == 0 ||
+        (m_SharedFrame.generation == afterGeneration &&
+         m_SharedFrame.sequence <= afterSequence))
+    {
+        ReleaseSRWLockExclusive(&m_Lock);
+        return STATUS_DEVICE_NOT_READY;
+    }
+    memcpy(output, &m_SharedFrame, sizeof(m_SharedFrame));
+    *bytesWritten = sizeof(m_SharedFrame);
+    ReleaseSRWLockExclusive(&m_Lock);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS FrameStore::SetTransport(UINT mode, UINT64 generation)
+{
+    AcquireSRWLockExclusive(&m_Lock);
+    NTSTATUS status = STATUS_SUCCESS;
+    if (mode == tabletdisplay::ipc::kFrameTransportCpu)
+    {
+        m_SharedEnabled = false;
+        m_SharedHeartbeatMs = 0;
+    }
+    else if (mode == tabletdisplay::ipc::kFrameTransportSharedTexture &&
+        m_SharedTexture && generation == m_SharedGeneration)
+    {
+        m_SharedEnabled = true;
+        m_SharedHeartbeatMs = GetTickCount64();
+    }
+    else
+    {
+        status = STATUS_INVALID_PARAMETER;
+    }
+    ReleaseSRWLockExclusive(&m_Lock);
+    return status;
 }
 
 bool FrameStore::Publish(
@@ -563,56 +848,68 @@ void SwapChainProcessor::RunCore()
                     SourceDescription.Height <= tabletdisplay::ipc::kMaxFrameHeight;
                 if (supportedFormat && supportedSize)
                 {
-                    if (!StagingTexture ||
-                        StagingDescription.Width != SourceDescription.Width ||
-                        StagingDescription.Height != SourceDescription.Height ||
-                        StagingDescription.Format != SourceDescription.Format)
-                    {
-                        StagingDescription = SourceDescription;
-                        StagingDescription.BindFlags = 0;
-                        StagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-                        StagingDescription.Usage = D3D11_USAGE_STAGING;
-                        StagingDescription.MiscFlags = 0;
-                        StagingDescription.ArraySize = 1;
-                        StagingDescription.MipLevels = 1;
-                        StagingDescription.SampleDesc.Count = 1;
-                        StagingDescription.SampleDesc.Quality = 0;
-                        StagingTexture.Reset();
-                        (void)m_Device->Device->CreateTexture2D(
-                            &StagingDescription,
-                            nullptr,
-                            &StagingTexture);
-                    }
+                    LARGE_INTEGER Counter = {};
+                    LARGE_INTEGER Frequency = {};
+                    QueryPerformanceCounter(&Counter);
+                    QueryPerformanceFrequency(&Frequency);
+                    const UINT64 TimestampUs = Frequency.QuadPart > 0
+                        ? static_cast<UINT64>(Counter.QuadPart / Frequency.QuadPart) * 1'000'000ULL +
+                          static_cast<UINT64>(Counter.QuadPart % Frequency.QuadPart) * 1'000'000ULL /
+                              static_cast<UINT64>(Frequency.QuadPart)
+                        : 0;
+                    bool sharedOnly = false;
+                    (void)m_Frames->PublishShared(
+                        m_Device->Device.Get(),
+                        m_Device->DeviceContext.Get(),
+                        SourceTexture.Get(),
+                        SourceDescription,
+                        TimestampUs,
+                        &sharedOnly);
 
-                    if (StagingTexture)
+                    if (!sharedOnly)
                     {
-                        m_Device->DeviceContext->CopyResource(
-                            StagingTexture.Get(),
-                            SourceTexture.Get());
-                        D3D11_MAPPED_SUBRESOURCE Mapped = {};
-                        if (SUCCEEDED(m_Device->DeviceContext->Map(
-                                StagingTexture.Get(),
-                                0,
-                                D3D11_MAP_READ,
-                                0,
-                                &Mapped)))
+                        if (!StagingTexture ||
+                            StagingDescription.Width != SourceDescription.Width ||
+                            StagingDescription.Height != SourceDescription.Height ||
+                            StagingDescription.Format != SourceDescription.Format)
                         {
-                            LARGE_INTEGER Counter = {};
-                            LARGE_INTEGER Frequency = {};
-                            QueryPerformanceCounter(&Counter);
-                            QueryPerformanceFrequency(&Frequency);
-                            const UINT64 TimestampUs = Frequency.QuadPart > 0
-                                ? static_cast<UINT64>(Counter.QuadPart / Frequency.QuadPart) * 1'000'000ULL +
-                                  static_cast<UINT64>(Counter.QuadPart % Frequency.QuadPart) * 1'000'000ULL /
-                                      static_cast<UINT64>(Frequency.QuadPart)
-                                : 0;
-                            (void)m_Frames->Publish(
-                                Mapped.pData,
-                                SourceDescription.Width,
-                                SourceDescription.Height,
-                                Mapped.RowPitch,
-                                TimestampUs);
-                            m_Device->DeviceContext->Unmap(StagingTexture.Get(), 0);
+                            StagingDescription = SourceDescription;
+                            StagingDescription.BindFlags = 0;
+                            StagingDescription.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                            StagingDescription.Usage = D3D11_USAGE_STAGING;
+                            StagingDescription.MiscFlags = 0;
+                            StagingDescription.ArraySize = 1;
+                            StagingDescription.MipLevels = 1;
+                            StagingDescription.SampleDesc.Count = 1;
+                            StagingDescription.SampleDesc.Quality = 0;
+                            StagingTexture.Reset();
+                            (void)m_Device->Device->CreateTexture2D(
+                                &StagingDescription,
+                                nullptr,
+                                &StagingTexture);
+                        }
+
+                        if (StagingTexture)
+                        {
+                            m_Device->DeviceContext->CopyResource(
+                                StagingTexture.Get(),
+                                SourceTexture.Get());
+                            D3D11_MAPPED_SUBRESOURCE Mapped = {};
+                            if (SUCCEEDED(m_Device->DeviceContext->Map(
+                                    StagingTexture.Get(),
+                                    0,
+                                    D3D11_MAP_READ,
+                                    0,
+                                    &Mapped)))
+                            {
+                                (void)m_Frames->Publish(
+                                    Mapped.pData,
+                                    SourceDescription.Width,
+                                    SourceDescription.Height,
+                                    Mapped.RowPitch,
+                                    TimestampUs);
+                                m_Device->DeviceContext->Unmap(StagingTexture.Get(), 0);
+                            }
                         }
                     }
                 }
@@ -671,6 +968,22 @@ NTSTATUS IndirectDeviceContext::CopyLatestFrame(
     size_t* bytesWritten)
 {
     return m_Frames->CopyLatest(afterSequence, output, outputBytes, bytesWritten);
+}
+
+NTSTATUS IndirectDeviceContext::CopySharedFrame(
+    UINT64 afterSequence,
+    UINT64 afterGeneration,
+    void* output,
+    size_t outputBytes,
+    size_t* bytesWritten)
+{
+    return m_Frames->CopyShared(
+        afterSequence, afterGeneration, output, outputBytes, bytesWritten);
+}
+
+NTSTATUS IndirectDeviceContext::SetFrameTransport(UINT mode, UINT64 generation)
+{
+    return m_Frames->SetTransport(mode, generation);
 }
 
 void IndirectDeviceContext::InitAdapter()
@@ -883,6 +1196,90 @@ VOID IddSampleDeviceIoControl(
                         Output,
                         OutputBufferLength,
                         &BytesWritten);
+                }
+            }
+        }
+    }
+    else if (IoControlCode == tabletdisplay::ipc::kGetSharedFrameIoctl)
+    {
+        tabletdisplay::ipc::SharedFrameRequest* FrameRequest = nullptr;
+        void* Output = nullptr;
+        if (InputBufferLength < sizeof(*FrameRequest) ||
+            OutputBufferLength < sizeof(tabletdisplay::ipc::SharedFrameResponse))
+        {
+            Status = STATUS_BUFFER_TOO_SMALL;
+        }
+        else
+        {
+            Status = WdfRequestRetrieveInputBuffer(
+                Request,
+                sizeof(*FrameRequest),
+                reinterpret_cast<void**>(&FrameRequest),
+                nullptr);
+            if (NT_SUCCESS(Status) &&
+                (FrameRequest->structureBytes != sizeof(*FrameRequest) ||
+                 FrameRequest->reserved != 0))
+            {
+                Status = STATUS_INVALID_PARAMETER;
+            }
+            if (NT_SUCCESS(Status))
+            {
+                Status = WdfRequestRetrieveOutputBuffer(
+                    Request,
+                    sizeof(tabletdisplay::ipc::SharedFrameResponse),
+                    &Output,
+                    nullptr);
+            }
+            if (NT_SUCCESS(Status))
+            {
+                auto* DeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+                if (DeviceContext == nullptr || DeviceContext->pContext == nullptr)
+                {
+                    Status = STATUS_DEVICE_NOT_READY;
+                }
+                else
+                {
+                    Status = DeviceContext->pContext->CopySharedFrame(
+                        FrameRequest->afterSequence,
+                        FrameRequest->afterGeneration,
+                        Output,
+                        OutputBufferLength,
+                        &BytesWritten);
+                }
+            }
+        }
+    }
+    else if (IoControlCode == tabletdisplay::ipc::kSetFrameTransportIoctl)
+    {
+        tabletdisplay::ipc::FrameTransportRequest* TransportRequest = nullptr;
+        if (InputBufferLength < sizeof(*TransportRequest))
+        {
+            Status = STATUS_BUFFER_TOO_SMALL;
+        }
+        else
+        {
+            Status = WdfRequestRetrieveInputBuffer(
+                Request,
+                sizeof(*TransportRequest),
+                reinterpret_cast<void**>(&TransportRequest),
+                nullptr);
+            if (NT_SUCCESS(Status) &&
+                TransportRequest->structureBytes != sizeof(*TransportRequest))
+            {
+                Status = STATUS_INVALID_PARAMETER;
+            }
+            if (NT_SUCCESS(Status))
+            {
+                auto* DeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+                if (DeviceContext == nullptr || DeviceContext->pContext == nullptr)
+                {
+                    Status = STATUS_DEVICE_NOT_READY;
+                }
+                else
+                {
+                    Status = DeviceContext->pContext->SetFrameTransport(
+                        TransportRequest->mode,
+                        TransportRequest->generation);
                 }
             }
         }

@@ -6,6 +6,8 @@
 #include <codecapi.h>
 #include <d3d10_1.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
+#include <dxgi1_4.h>
 #include <icodecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -203,9 +205,25 @@ namespace tabletdisplay::host
             UINT resetToken{};
             CheckHr(MFCreateDXGIDeviceManager(&resetToken, &deviceManager), "MFCreateDXGIDeviceManager");
             D3D_FEATURE_LEVEL featureLevel{};
+            ComPtr<IDXGIAdapter> selectedAdapter;
+            D3D_DRIVER_TYPE driverType = D3D_DRIVER_TYPE_HARDWARE;
+            if (options.adapterLuid != 0)
+            {
+                ComPtr<IDXGIFactory4> factory;
+                CheckHr(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)),
+                    "CreateDXGIFactory2(encoder adapter)");
+                LUID requestedLuid{};
+                requestedLuid.LowPart = static_cast<DWORD>(options.adapterLuid);
+                requestedLuid.HighPart = static_cast<LONG>(
+                    static_cast<std::uint64_t>(options.adapterLuid) >> 32U);
+                CheckHr(factory->EnumAdapterByLuid(
+                    requestedLuid, IID_PPV_ARGS(&selectedAdapter)),
+                    "EnumAdapterByLuid(encoder)");
+                driverType = D3D_DRIVER_TYPE_UNKNOWN;
+            }
             CheckHr(D3D11CreateDevice(
-                nullptr,
-                D3D_DRIVER_TYPE_HARDWARE,
+                selectedAdapter.Get(),
+                driverType,
                 nullptr,
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
                 nullptr,
@@ -245,7 +263,8 @@ namespace tabletdisplay::host
         void InitializeBgraVideoProcessor(
             std::uint32_t sourceWidth,
             std::uint32_t sourceHeight,
-            std::uint32_t clockwiseQuarterTurns)
+            std::uint32_t clockwiseQuarterTurns,
+            ID3D11Texture2D* externalInputTexture = nullptr)
         {
             if (!hardware) throw std::runtime_error("GPU BGRA conversion requires a hardware encoder");
             if (clockwiseQuarterTurns > 3)
@@ -295,17 +314,35 @@ namespace tabletdisplay::host
             CheckHr(videoDevice->CreateVideoProcessor(enumerator.Get(), 0, &processor),
                 "CreateVideoProcessor(BGRA to NV12)");
 
-            D3D11_TEXTURE2D_DESC inputDescription{};
-            inputDescription.Width = sourceWidth;
-            inputDescription.Height = sourceHeight;
-            inputDescription.MipLevels = 1;
-            inputDescription.ArraySize = 1;
-            inputDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            inputDescription.SampleDesc.Count = 1;
-            inputDescription.Usage = D3D11_USAGE_DEFAULT;
             ComPtr<ID3D11Texture2D> inputTexture;
-            CheckHr(d3dDevice->CreateTexture2D(&inputDescription, nullptr, &inputTexture),
-                "CreateTexture2D(reusable BGRA input)");
+            if (externalInputTexture != nullptr)
+            {
+                D3D11_TEXTURE2D_DESC externalDescription{};
+                externalInputTexture->GetDesc(&externalDescription);
+                if (externalDescription.Width != sourceWidth ||
+                    externalDescription.Height != sourceHeight ||
+                    externalDescription.Format != DXGI_FORMAT_B8G8R8A8_UNORM ||
+                    externalDescription.MipLevels != 1 ||
+                    externalDescription.ArraySize != 1 ||
+                    externalDescription.SampleDesc.Count != 1)
+                {
+                    throw std::runtime_error("Shared BGRA texture has an unsupported description");
+                }
+                inputTexture = externalInputTexture;
+            }
+            else
+            {
+                D3D11_TEXTURE2D_DESC inputDescription{};
+                inputDescription.Width = sourceWidth;
+                inputDescription.Height = sourceHeight;
+                inputDescription.MipLevels = 1;
+                inputDescription.ArraySize = 1;
+                inputDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                inputDescription.SampleDesc.Count = 1;
+                inputDescription.Usage = D3D11_USAGE_DEFAULT;
+                CheckHr(d3dDevice->CreateTexture2D(&inputDescription, nullptr, &inputTexture),
+                    "CreateTexture2D(reusable BGRA input)");
+            }
 
             D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDescription{};
             inputViewDescription.FourCC = 0;
@@ -349,10 +386,28 @@ namespace tabletdisplay::host
             videoProcessorEnumerator = std::move(enumerator);
             videoProcessor = std::move(processor);
             videoContext = std::move(processorContext);
+            sharedBgraInput = externalInputTexture != nullptr;
+            if (!sharedBgraInput)
+            {
+                sharedMutex.Reset();
+                sharedResourceName.clear();
+                sharedGeneration = 0;
+            }
             gpuBgraConversion = true;
             bgraConversionName = clockwiseQuarterTurns == 0
                 ? "D3D11 VideoProcessor BGRA->NV12 (zero-copy to encoder)"
                 : "D3D11 VideoProcessor BGRA->NV12 + rotation (zero-copy to encoder)";
+        }
+
+        void RunVideoProcessorBlt()
+        {
+            D3D11_VIDEO_PROCESSOR_STREAM stream{};
+            stream.Enable = TRUE;
+            stream.pInputSurface = bgraInputView.Get();
+            CheckHr(videoContext->VideoProcessorBlt(
+                videoProcessor.Get(), nv12OutputView.Get(), 0, 1, &stream),
+                "VideoProcessorBlt(BGRA to NV12)");
+            inputFrameReady = true;
         }
 
         void ConvertBgraOnGpu(
@@ -368,7 +423,7 @@ namespace tabletdisplay::host
                     std::numeric_limits<std::size_t>::max() / sourceStride ||
                 bgra.size() < sourceStride * sourceHeight)
                 throw std::invalid_argument("BGRA buffer is too small");
-            if (!videoProcessor || bgraInputWidth != sourceWidth ||
+            if (!videoProcessor || sharedBgraInput || bgraInputWidth != sourceWidth ||
                 bgraInputHeight != sourceHeight || bgraRotation != clockwiseQuarterTurns)
             {
                 InitializeBgraVideoProcessor(sourceWidth, sourceHeight, clockwiseQuarterTurns);
@@ -381,12 +436,7 @@ namespace tabletdisplay::host
                 bgra.data(),
                 static_cast<UINT>(sourceStride),
                 static_cast<UINT>(sourceStride * sourceHeight));
-            D3D11_VIDEO_PROCESSOR_STREAM stream{};
-            stream.Enable = TRUE;
-            stream.pInputSurface = bgraInputView.Get();
-            CheckHr(videoContext->VideoProcessorBlt(
-                videoProcessor.Get(), nv12OutputView.Get(), 0, 1, &stream),
-                "VideoProcessorBlt(BGRA to NV12)");
+            RunVideoProcessorBlt();
         }
 
         void Configure()
@@ -515,6 +565,7 @@ namespace tabletdisplay::host
                     nv12.data(),
                     options.width,
                     static_cast<UINT>(nv12.size()));
+                inputFrameReady = true;
                 buffer = hardwareInputBuffer;
             }
             else
@@ -746,6 +797,90 @@ namespace tabletdisplay::host
             return SubmitInputSample(sample.Get(), forceKeyFrame);
         }
 
+        void PrepareSharedBgra(
+            std::wstring_view resourceName,
+            std::uint64_t generation,
+            std::uint32_t sourceWidth,
+            std::uint32_t sourceHeight,
+            std::uint32_t clockwiseQuarterTurns)
+        {
+            if (!hardware)
+                throw std::runtime_error("Shared D3D11 input requires a hardware encoder");
+            if (resourceName.empty() || generation == 0)
+                throw std::invalid_argument("Invalid shared BGRA resource identity");
+            if (sharedBgraInput && sharedGeneration == generation &&
+                sharedResourceName == resourceName && videoProcessor && sharedMutex)
+            {
+                return;
+            }
+
+            ComPtr<ID3D11Device1> device1;
+            CheckHr(d3dDevice.As(&device1), "ID3D11Device1(shared BGRA)");
+            ComPtr<ID3D11Texture2D> texture;
+            const std::wstring nullTerminatedName(resourceName);
+            CheckHr(device1->OpenSharedResourceByName(
+                nullTerminatedName.c_str(),
+                DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+                IID_PPV_ARGS(&texture)), "OpenSharedResourceByName(BGRA)");
+            ComPtr<IDXGIKeyedMutex> keyedMutex;
+            CheckHr(texture.As(&keyedMutex), "IDXGIKeyedMutex(shared BGRA)");
+            InitializeBgraVideoProcessor(
+                sourceWidth,
+                sourceHeight,
+                clockwiseQuarterTurns,
+                texture.Get());
+            sharedMutex = std::move(keyedMutex);
+            sharedGeneration = generation;
+            sharedResourceName = resourceName;
+            bgraConversionName = clockwiseQuarterTurns == 0
+                ? "shared D3D11 BGRA texture -> VideoProcessor NV12 -> encoder"
+                : "shared D3D11 BGRA texture -> GPU rotation/NV12 -> encoder";
+        }
+
+        [[nodiscard]] std::vector<EncodedAccessUnit> EncodeSharedBgra(
+            std::wstring_view resourceName,
+            std::uint64_t generation,
+            std::uint32_t sourceWidth,
+            std::uint32_t sourceHeight,
+            std::uint32_t clockwiseQuarterTurns,
+            std::uint64_t presentationTimeUs,
+            bool forceKeyFrame)
+        {
+            PrepareSharedBgra(
+                resourceName,
+                generation,
+                sourceWidth,
+                sourceHeight,
+                clockwiseQuarterTurns);
+            const HRESULT acquireResult = sharedMutex->AcquireSync(1, 250);
+            if (acquireResult == WAIT_TIMEOUT)
+                throw std::runtime_error("Timed out waiting for the shared D3D11 frame");
+            CheckHr(acquireResult, "AcquireSync(shared BGRA)");
+            try
+            {
+                RunVideoProcessorBlt();
+                d3dContext->Flush();
+                CheckHr(sharedMutex->ReleaseSync(0), "ReleaseSync(shared BGRA)");
+            }
+            catch (...)
+            {
+                (void)sharedMutex->ReleaseSync(0);
+                throw;
+            }
+            auto sample = MakeSampleFromBuffer(hardwareInputBuffer.Get(), presentationTimeUs);
+            return SubmitInputSample(sample.Get(), forceKeyFrame);
+        }
+
+        [[nodiscard]] std::vector<EncodedAccessUnit> EncodeRepeatedFrame(
+            std::uint64_t presentationTimeUs,
+            bool forceKeyFrame)
+        {
+            if (!hardware || !inputFrameReady || !hardwareInputBuffer)
+                throw std::runtime_error("No reusable hardware frame is available");
+            auto sample = MakeSampleFromBuffer(hardwareInputBuffer.Get(), presentationTimeUs);
+            return SubmitInputSample(sample.Get(), forceKeyFrame);
+        }
+
         [[nodiscard]] std::vector<EncodedAccessUnit> Drain()
         {
             CheckHr(transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0), "MFT drain");
@@ -794,11 +929,14 @@ namespace tabletdisplay::host
         ComPtr<ID3D11Texture2D> bgraInputTexture;
         ComPtr<ID3D11VideoProcessorInputView> bgraInputView;
         ComPtr<ID3D11VideoProcessorOutputView> nv12OutputView;
+        ComPtr<IDXGIKeyedMutex> sharedMutex;
         std::vector<std::uint8_t> cpuRotatedBgra;
         std::vector<std::uint8_t> cpuNv12;
         std::optional<tabletdisplay::video::H264CodecConfig> config;
         std::string name;
         std::string bgraConversionName{ "CPU BGRA->NV12" };
+        std::wstring sharedResourceName;
+        std::uint64_t sharedGeneration{};
         std::uint32_t bgraInputWidth{};
         std::uint32_t bgraInputHeight{};
         std::uint32_t bgraRotation{};
@@ -807,6 +945,8 @@ namespace tabletdisplay::host
         bool hardware{};
         bool gpuBgraConversion{};
         bool gpuBgraFailed{};
+        bool sharedBgraInput{};
+        bool inputFrameReady{};
         bool asynchronous{};
         std::uint32_t pendingNeedInput{};
         std::uint32_t pendingHaveOutput{};
@@ -848,6 +988,47 @@ namespace tabletdisplay::host
             forceKeyFrame);
     }
 
+    void MediaFoundationH264Encoder::PrepareSharedBgra(
+        std::wstring_view resourceName,
+        std::uint64_t generation,
+        std::uint32_t sourceWidth,
+        std::uint32_t sourceHeight,
+        std::uint32_t clockwiseQuarterTurns)
+    {
+        m_impl->PrepareSharedBgra(
+            resourceName,
+            generation,
+            sourceWidth,
+            sourceHeight,
+            clockwiseQuarterTurns);
+    }
+
+    std::vector<EncodedAccessUnit> MediaFoundationH264Encoder::EncodeSharedBgra(
+        std::wstring_view resourceName,
+        std::uint64_t generation,
+        std::uint32_t sourceWidth,
+        std::uint32_t sourceHeight,
+        std::uint32_t clockwiseQuarterTurns,
+        std::uint64_t presentationTimeUs,
+        bool forceKeyFrame)
+    {
+        return m_impl->EncodeSharedBgra(
+            resourceName,
+            generation,
+            sourceWidth,
+            sourceHeight,
+            clockwiseQuarterTurns,
+            presentationTimeUs,
+            forceKeyFrame);
+    }
+
+    std::vector<EncodedAccessUnit> MediaFoundationH264Encoder::EncodeRepeatedFrame(
+        std::uint64_t presentationTimeUs,
+        bool forceKeyFrame)
+    {
+        return m_impl->EncodeRepeatedFrame(presentationTimeUs, forceKeyFrame);
+    }
+
     std::vector<EncodedAccessUnit> MediaFoundationH264Encoder::Drain()
     {
         return m_impl->Drain();
@@ -866,6 +1047,11 @@ namespace tabletdisplay::host
     bool MediaFoundationH264Encoder::UsesGpuBgraConversion() const noexcept
     {
         return m_impl->gpuBgraConversion;
+    }
+
+    bool MediaFoundationH264Encoder::UsesSharedBgraInput() const noexcept
+    {
+        return m_impl->sharedBgraInput;
     }
 
     const std::string& MediaFoundationH264Encoder::BgraConversionName() const noexcept

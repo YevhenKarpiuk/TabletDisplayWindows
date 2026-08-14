@@ -13,6 +13,7 @@
 #include <wrl.h>
 
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "Trace.h"
@@ -71,6 +72,7 @@ namespace Microsoft
         {
         public:
             FrameStore();
+            ~FrameStore();
 
             bool Publish(
                 const void* pixels,
@@ -83,11 +85,38 @@ namespace Microsoft
                 void* output,
                 size_t outputBytes,
                 size_t* bytesWritten);
+            bool PublishShared(
+                ID3D11Device* device,
+                ID3D11DeviceContext* context,
+                ID3D11Texture2D* source,
+                const D3D11_TEXTURE2D_DESC& sourceDescription,
+                UINT64 timestampUs,
+                bool* sharedOnly);
+            NTSTATUS CopyShared(
+                UINT64 afterSequence,
+                UINT64 afterGeneration,
+                void* output,
+                size_t outputBytes,
+                size_t* bytesWritten);
+            NTSTATUS SetTransport(UINT mode, UINT64 generation);
 
         private:
+            bool CreateSharedTextureLocked(
+                ID3D11Device* device,
+                const D3D11_TEXTURE2D_DESC& sourceDescription);
+            void ResetSharedTextureLocked();
+
             SRWLOCK m_Lock;
             tabletdisplay::ipc::FrameResponseHeader m_Header;
             std::vector<BYTE> m_Pixels;
+            Microsoft::WRL::ComPtr<ID3D11Device> m_SharedDevice;
+            Microsoft::WRL::ComPtr<ID3D11Texture2D> m_SharedTexture;
+            Microsoft::WRL::ComPtr<IDXGIKeyedMutex> m_SharedMutex;
+            HANDLE m_SharedHandle{};
+            tabletdisplay::ipc::SharedFrameResponse m_SharedFrame;
+            UINT64 m_SharedGeneration{};
+            UINT64 m_SharedHeartbeatMs{};
+            bool m_SharedEnabled{};
         };
 
         /// <summary>
@@ -133,6 +162,13 @@ namespace Microsoft
                 void* output,
                 size_t outputBytes,
                 size_t* bytesWritten);
+            NTSTATUS CopySharedFrame(
+                UINT64 afterSequence,
+                UINT64 afterGeneration,
+                void* output,
+                size_t outputBytes,
+                size_t* bytesWritten);
+            NTSTATUS SetFrameTransport(UINT mode, UINT64 generation);
 
         protected:
             WDFDEVICE m_WdfDevice;

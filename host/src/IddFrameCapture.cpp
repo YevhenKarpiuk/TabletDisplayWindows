@@ -168,6 +168,24 @@ namespace tabletdisplay::host
                 tabletdisplay::ipc::kMaxFrameBytes);
         }
 
+        ~Impl()
+        {
+            if (sharedTransport)
+            {
+                tabletdisplay::ipc::FrameTransportRequest request{};
+                DWORD returnedBytes{};
+                (void)DeviceIoControl(
+                    device.get(),
+                    tabletdisplay::ipc::kSetFrameTransportIoctl,
+                    &request,
+                    static_cast<DWORD>(sizeof(request)),
+                    nullptr,
+                    0,
+                    &returnedBytes,
+                    nullptr);
+            }
+        }
+
         [[nodiscard]] bool Capture(CapturedFrame& frame, std::uint32_t timeoutMs)
         {
             const auto deadline = std::chrono::steady_clock::now() +
@@ -213,6 +231,116 @@ namespace tabletdisplay::host
             }
         }
 
+        [[nodiscard]] bool CaptureShared(
+            SharedCapturedFrame& frame,
+            std::uint32_t timeoutMs,
+            bool updateSequence)
+        {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(timeoutMs);
+            for (;;)
+            {
+                tabletdisplay::ipc::SharedFrameRequest request{};
+                request.afterSequence = updateSequence ? lastSharedSequence : 0;
+                request.afterGeneration = updateSequence ? lastSharedGeneration : 0;
+                tabletdisplay::ipc::SharedFrameResponse sharedResponse{};
+                DWORD returnedBytes{};
+                if (DeviceIoControl(
+                        device.get(),
+                        tabletdisplay::ipc::kGetSharedFrameIoctl,
+                        &request,
+                        static_cast<DWORD>(sizeof(request)),
+                        &sharedResponse,
+                        static_cast<DWORD>(sizeof(sharedResponse)),
+                        &returnedBytes,
+                        nullptr))
+                {
+                    if (returnedBytes != sizeof(sharedResponse) ||
+                        sharedResponse.magic != tabletdisplay::ipc::kSharedFrameMagic ||
+                        sharedResponse.versionMajor != tabletdisplay::ipc::kFrameVersionMajor ||
+                        sharedResponse.versionMinor != tabletdisplay::ipc::kFrameVersionMinor ||
+                        sharedResponse.structureBytes != sizeof(sharedResponse) ||
+                        sharedResponse.pixelFormat != tabletdisplay::ipc::kPixelFormatBgra8 ||
+                        sharedResponse.width == 0 ||
+                        sharedResponse.width > tabletdisplay::ipc::kMaxFrameWidth ||
+                        sharedResponse.height == 0 ||
+                        sharedResponse.height > tabletdisplay::ipc::kMaxFrameHeight ||
+                        sharedResponse.sequence == 0 ||
+                        sharedResponse.generation == 0 ||
+                        sharedResponse.resourceNameLength == 0 ||
+                        sharedResponse.resourceNameLength >= tabletdisplay::ipc::kSharedResourceNameChars ||
+                        sharedResponse.resourceName[sharedResponse.resourceNameLength] != L'\0')
+                    {
+                        throw std::runtime_error(
+                            "TabletDisplay driver returned invalid shared-frame metadata");
+                    }
+                    LARGE_INTEGER adapterLuid{};
+                    adapterLuid.LowPart = sharedResponse.adapterLuidLow;
+                    adapterLuid.HighPart = sharedResponse.adapterLuidHigh;
+                    frame.resourceName.assign(
+                        sharedResponse.resourceName,
+                        sharedResponse.resourceNameLength);
+                    frame.width = sharedResponse.width;
+                    frame.height = sharedResponse.height;
+                    frame.adapterLuid = adapterLuid.QuadPart;
+                    frame.sequence = sharedResponse.sequence;
+                    frame.timestampUs = sharedResponse.timestampUs;
+                    frame.generation = sharedResponse.generation;
+                    if (updateSequence)
+                    {
+                        lastSharedSequence = sharedResponse.sequence;
+                        lastSharedGeneration = sharedResponse.generation;
+                    }
+                    return true;
+                }
+
+                const auto error = GetLastError();
+                if (error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED)
+                {
+                    return false;
+                }
+                if (error != ERROR_NOT_READY && error != ERROR_NO_MORE_ITEMS &&
+                    error != ERROR_RETRY && error != ERROR_BUSY)
+                {
+                    throw std::runtime_error(
+                        "TabletDisplay shared-frame IOCTL failed with Windows error " +
+                        std::to_string(error));
+                }
+                if (timeoutMs == 0 || std::chrono::steady_clock::now() >= deadline)
+                {
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+
+        void SetSharedTransport(bool enabled, std::uint64_t generation)
+        {
+            tabletdisplay::ipc::FrameTransportRequest request{};
+            request.mode = enabled
+                ? tabletdisplay::ipc::kFrameTransportSharedTexture
+                : tabletdisplay::ipc::kFrameTransportCpu;
+            request.generation = enabled ? generation : 0;
+            DWORD returnedBytes{};
+            if (!DeviceIoControl(
+                    device.get(),
+                    tabletdisplay::ipc::kSetFrameTransportIoctl,
+                    &request,
+                    static_cast<DWORD>(sizeof(request)),
+                    nullptr,
+                    0,
+                    &returnedBytes,
+                    nullptr))
+            {
+                throw std::runtime_error(
+                    "Cannot switch TabletDisplay frame transport, Windows error " +
+                    std::to_string(GetLastError()));
+            }
+            sharedTransport = enabled;
+            lastSharedSequence = 0;
+            lastSharedGeneration = 0;
+        }
+
         void AcceptResponse(DWORD returnedBytes)
         {
             if (returnedBytes < sizeof(tabletdisplay::ipc::FrameResponseHeader))
@@ -248,6 +376,9 @@ namespace tabletdisplay::host
         std::vector<std::uint8_t> pixels;
         tabletdisplay::ipc::FrameResponseHeader header{};
         std::uint64_t lastSequence{};
+        std::uint64_t lastSharedSequence{};
+        std::uint64_t lastSharedGeneration{};
+        bool sharedTransport{};
     };
 
     IddFrameCapture::IddFrameCapture() : m_impl(std::make_unique<Impl>()) {}
@@ -256,5 +387,25 @@ namespace tabletdisplay::host
     bool IddFrameCapture::Capture(CapturedFrame& frame, std::uint32_t timeoutMs)
     {
         return m_impl->Capture(frame, timeoutMs);
+    }
+
+    bool IddFrameCapture::ProbeShared(SharedCapturedFrame& frame, std::uint32_t timeoutMs)
+    {
+        return m_impl->CaptureShared(frame, timeoutMs, false);
+    }
+
+    bool IddFrameCapture::CaptureShared(SharedCapturedFrame& frame, std::uint32_t timeoutMs)
+    {
+        return m_impl->CaptureShared(frame, timeoutMs, true);
+    }
+
+    void IddFrameCapture::SetSharedTransport(bool enabled, std::uint64_t generation)
+    {
+        m_impl->SetSharedTransport(enabled, generation);
+    }
+
+    bool IddFrameCapture::UsesSharedTransport() const noexcept
+    {
+        return m_impl->sharedTransport;
     }
 }
