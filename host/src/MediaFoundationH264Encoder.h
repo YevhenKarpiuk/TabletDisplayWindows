@@ -2,6 +2,7 @@
 
 #include "video/VideoProcessing.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -38,10 +39,20 @@ namespace tabletdisplay::host
             std::span<const std::uint8_t> nv12,
             std::uint64_t presentationTimeUs,
             bool forceKeyFrame = false);
+        [[nodiscard]] std::vector<EncodedAccessUnit> EncodeBgra(
+            std::span<const std::uint8_t> bgra,
+            std::uint32_t sourceWidth,
+            std::uint32_t sourceHeight,
+            std::size_t sourceStride,
+            std::uint32_t clockwiseQuarterTurns,
+            std::uint64_t presentationTimeUs,
+            bool forceKeyFrame = false);
         [[nodiscard]] std::vector<EncodedAccessUnit> Drain();
 
         [[nodiscard]] const std::string& Name() const noexcept;
         [[nodiscard]] bool IsHardware() const noexcept;
+        [[nodiscard]] bool UsesGpuBgraConversion() const noexcept;
+        [[nodiscard]] const std::string& BgraConversionName() const noexcept;
         [[nodiscard]] const tabletdisplay::video::H264CodecConfig* CodecConfig() const noexcept;
 
     private:

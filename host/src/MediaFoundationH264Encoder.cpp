@@ -230,6 +230,7 @@ namespace tabletdisplay::host
             description.Format = DXGI_FORMAT_NV12;
             description.SampleDesc.Count = 1;
             description.Usage = D3D11_USAGE_DEFAULT;
+            description.BindFlags = D3D11_BIND_RENDER_TARGET;
             CheckHr(d3dDevice->CreateTexture2D(
                 &description, nullptr, &hardwareInputTexture),
                 "CreateTexture2D(reusable NV12 input)");
@@ -239,6 +240,153 @@ namespace tabletdisplay::host
                 0,
                 FALSE,
                 &hardwareInputBuffer), "MFCreateDXGISurfaceBuffer(reusable input)");
+        }
+
+        void InitializeBgraVideoProcessor(
+            std::uint32_t sourceWidth,
+            std::uint32_t sourceHeight,
+            std::uint32_t clockwiseQuarterTurns)
+        {
+            if (!hardware) throw std::runtime_error("GPU BGRA conversion requires a hardware encoder");
+            if (clockwiseQuarterTurns > 3)
+                throw std::invalid_argument("Invalid BGRA rotation");
+            const auto rotatedWidth = (clockwiseQuarterTurns & 1U) != 0 ? sourceHeight : sourceWidth;
+            const auto rotatedHeight = (clockwiseQuarterTurns & 1U) != 0 ? sourceWidth : sourceHeight;
+            if (rotatedWidth != options.width || rotatedHeight != options.height)
+                throw std::invalid_argument("Rotated BGRA dimensions do not match encoder configuration");
+
+            ComPtr<ID3D11VideoDevice> videoDevice;
+            ComPtr<ID3D11VideoContext> processorContext;
+            CheckHr(d3dDevice.As(&videoDevice), "ID3D11VideoDevice");
+            CheckHr(d3dContext.As(&processorContext), "ID3D11VideoContext");
+
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+            content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+            content.InputFrameRate = { options.fps, 1 };
+            content.InputWidth = sourceWidth;
+            content.InputHeight = sourceHeight;
+            content.OutputFrameRate = { options.fps, 1 };
+            content.OutputWidth = options.width;
+            content.OutputHeight = options.height;
+            content.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
+
+            ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
+            CheckHr(videoDevice->CreateVideoProcessorEnumerator(&content, &enumerator),
+                "CreateVideoProcessorEnumerator(BGRA to NV12)");
+            UINT inputFormatSupport{};
+            UINT outputFormatSupport{};
+            CheckHr(enumerator->CheckVideoProcessorFormat(
+                DXGI_FORMAT_B8G8R8A8_UNORM, &inputFormatSupport),
+                "CheckVideoProcessorFormat(BGRA)");
+            CheckHr(enumerator->CheckVideoProcessorFormat(
+                DXGI_FORMAT_NV12, &outputFormatSupport),
+                "CheckVideoProcessorFormat(NV12)");
+            if ((inputFormatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0 ||
+                (outputFormatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0)
+                throw std::runtime_error("The GPU video processor does not support BGRA to NV12");
+
+            D3D11_VIDEO_PROCESSOR_CAPS caps{};
+            CheckHr(enumerator->GetVideoProcessorCaps(&caps), "GetVideoProcessorCaps");
+            if (clockwiseQuarterTurns != 0 &&
+                (caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION) == 0)
+                throw std::runtime_error("The GPU video processor does not support rotation");
+
+            ComPtr<ID3D11VideoProcessor> processor;
+            CheckHr(videoDevice->CreateVideoProcessor(enumerator.Get(), 0, &processor),
+                "CreateVideoProcessor(BGRA to NV12)");
+
+            D3D11_TEXTURE2D_DESC inputDescription{};
+            inputDescription.Width = sourceWidth;
+            inputDescription.Height = sourceHeight;
+            inputDescription.MipLevels = 1;
+            inputDescription.ArraySize = 1;
+            inputDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            inputDescription.SampleDesc.Count = 1;
+            inputDescription.Usage = D3D11_USAGE_DEFAULT;
+            ComPtr<ID3D11Texture2D> inputTexture;
+            CheckHr(d3dDevice->CreateTexture2D(&inputDescription, nullptr, &inputTexture),
+                "CreateTexture2D(reusable BGRA input)");
+
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDescription{};
+            inputViewDescription.FourCC = 0;
+            inputViewDescription.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            inputViewDescription.Texture2D.MipSlice = 0;
+            inputViewDescription.Texture2D.ArraySlice = 0;
+            ComPtr<ID3D11VideoProcessorInputView> inputView;
+            CheckHr(videoDevice->CreateVideoProcessorInputView(
+                inputTexture.Get(), enumerator.Get(), &inputViewDescription, &inputView),
+                "CreateVideoProcessorInputView(BGRA)");
+
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDescription{};
+            outputViewDescription.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            outputViewDescription.Texture2D.MipSlice = 0;
+            ComPtr<ID3D11VideoProcessorOutputView> outputView;
+            CheckHr(videoDevice->CreateVideoProcessorOutputView(
+                hardwareInputTexture.Get(), enumerator.Get(), &outputViewDescription, &outputView),
+                "CreateVideoProcessorOutputView(NV12)");
+
+            const RECT sourceRect{ 0, 0,
+                static_cast<LONG>(sourceWidth), static_cast<LONG>(sourceHeight) };
+            const RECT destinationRect{ 0, 0,
+                static_cast<LONG>(options.width), static_cast<LONG>(options.height) };
+            processorContext->VideoProcessorSetStreamFrameFormat(
+                processor.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+            processorContext->VideoProcessorSetStreamSourceRect(processor.Get(), 0, TRUE, &sourceRect);
+            processorContext->VideoProcessorSetStreamDestRect(processor.Get(), 0, TRUE, &destinationRect);
+            processorContext->VideoProcessorSetOutputTargetRect(processor.Get(), TRUE, &destinationRect);
+            processorContext->VideoProcessorSetStreamRotation(
+                processor.Get(),
+                0,
+                clockwiseQuarterTurns != 0,
+                static_cast<D3D11_VIDEO_PROCESSOR_ROTATION>(clockwiseQuarterTurns));
+
+            bgraInputWidth = sourceWidth;
+            bgraInputHeight = sourceHeight;
+            bgraRotation = clockwiseQuarterTurns;
+            bgraInputTexture = std::move(inputTexture);
+            bgraInputView = std::move(inputView);
+            nv12OutputView = std::move(outputView);
+            videoProcessorEnumerator = std::move(enumerator);
+            videoProcessor = std::move(processor);
+            videoContext = std::move(processorContext);
+            gpuBgraConversion = true;
+            bgraConversionName = clockwiseQuarterTurns == 0
+                ? "D3D11 VideoProcessor BGRA->NV12 (zero-copy to encoder)"
+                : "D3D11 VideoProcessor BGRA->NV12 + rotation (zero-copy to encoder)";
+        }
+
+        void ConvertBgraOnGpu(
+            std::span<const std::uint8_t> bgra,
+            std::uint32_t sourceWidth,
+            std::uint32_t sourceHeight,
+            std::size_t sourceStride,
+            std::uint32_t clockwiseQuarterTurns)
+        {
+            if (sourceWidth == 0 || sourceHeight == 0 ||
+                sourceStride < static_cast<std::size_t>(sourceWidth) * 4U ||
+                static_cast<std::size_t>(sourceHeight) >
+                    std::numeric_limits<std::size_t>::max() / sourceStride ||
+                bgra.size() < sourceStride * sourceHeight)
+                throw std::invalid_argument("BGRA buffer is too small");
+            if (!videoProcessor || bgraInputWidth != sourceWidth ||
+                bgraInputHeight != sourceHeight || bgraRotation != clockwiseQuarterTurns)
+            {
+                InitializeBgraVideoProcessor(sourceWidth, sourceHeight, clockwiseQuarterTurns);
+            }
+
+            d3dContext->UpdateSubresource(
+                bgraInputTexture.Get(),
+                0,
+                nullptr,
+                bgra.data(),
+                static_cast<UINT>(sourceStride),
+                static_cast<UINT>(sourceStride * sourceHeight));
+            D3D11_VIDEO_PROCESSOR_STREAM stream{};
+            stream.Enable = TRUE;
+            stream.pInputSurface = bgraInputView.Get();
+            CheckHr(videoContext->VideoProcessorBlt(
+                videoProcessor.Get(), nv12OutputView.Get(), 0, 1, &stream),
+                "VideoProcessorBlt(BGRA to NV12)");
         }
 
         void Configure()
@@ -334,7 +482,20 @@ namespace tabletdisplay::host
             }
         }
 
-        [[nodiscard]] ComPtr<IMFSample> MakeInputSample(
+        [[nodiscard]] ComPtr<IMFSample> MakeSampleFromBuffer(
+            IMFMediaBuffer* buffer,
+            std::uint64_t presentationTimeUs)
+        {
+            if (buffer == nullptr) throw std::invalid_argument("Input buffer is null");
+            ComPtr<IMFSample> sample;
+            CheckHr(MFCreateSample(&sample), "MFCreateSample(input)");
+            CheckHr(sample->AddBuffer(buffer), "AddBuffer(input)");
+            CheckHr(sample->SetSampleTime(static_cast<LONGLONG>(presentationTimeUs * 10U)), "SetSampleTime(input)");
+            CheckHr(sample->SetSampleDuration(10'000'000LL / options.fps), "SetSampleDuration(input)");
+            return sample;
+        }
+
+        [[nodiscard]] ComPtr<IMFSample> MakeNv12InputSample(
             std::span<const std::uint8_t> nv12,
             std::uint64_t presentationTimeUs)
         {
@@ -374,12 +535,7 @@ namespace tabletdisplay::host
                     "SetCurrentLength(input)");
             }
 
-            ComPtr<IMFSample> sample;
-            CheckHr(MFCreateSample(&sample), "MFCreateSample(input)");
-            CheckHr(sample->AddBuffer(buffer.Get()), "AddBuffer(input)");
-            CheckHr(sample->SetSampleTime(static_cast<LONGLONG>(presentationTimeUs * 10U)), "SetSampleTime(input)");
-            CheckHr(sample->SetSampleDuration(10'000'000LL / options.fps), "SetSampleDuration(input)");
-            return sample;
+            return MakeSampleFromBuffer(buffer.Get(), presentationTimeUs);
         }
 
         void RefreshCodecConfig(std::span<const std::uint8_t> accessUnit)
@@ -484,18 +640,16 @@ namespace tabletdisplay::host
             };
         }
 
-        [[nodiscard]] std::vector<EncodedAccessUnit> Encode(
-            std::span<const std::uint8_t> nv12,
-            std::uint64_t presentationTimeUs,
+        [[nodiscard]] std::vector<EncodedAccessUnit> SubmitInputSample(
+            IMFSample* sample,
             bool forceKeyFrame)
         {
             if (forceKeyFrame) SetCodecBool(codec.Get(), CODECAPI_AVEncVideoForceKeyFrame, true);
-            auto sample = MakeInputSample(nv12, presentationTimeUs);
             std::vector<EncodedAccessUnit> output;
             if (asynchronous)
             {
                 WaitForEvent(METransformNeedInput);
-                CheckHr(transform->ProcessInput(inputId, sample.Get(), 0), "ProcessInput(async)");
+                CheckHr(transform->ProcessInput(inputId, sample, 0), "ProcessInput(async)");
                 for (;;)
                 {
                     WaitForEvent(METransformHaveOutput);
@@ -509,17 +663,87 @@ namespace tabletdisplay::host
                 return output;
             }
 
-            auto hr = transform->ProcessInput(inputId, sample.Get(), 0);
+            auto hr = transform->ProcessInput(inputId, sample, 0);
             while (hr == MF_E_NOTACCEPTING)
             {
                 auto encoded = TryReadOutput();
                 if (!encoded.has_value()) throw std::runtime_error("H.264 MFT rejected input without output");
                 output.push_back(std::move(*encoded));
-                hr = transform->ProcessInput(inputId, sample.Get(), 0);
+                hr = transform->ProcessInput(inputId, sample, 0);
             }
             CheckHr(hr, "ProcessInput");
             while (auto encoded = TryReadOutput()) output.push_back(std::move(*encoded));
             return output;
+        }
+
+        [[nodiscard]] std::vector<EncodedAccessUnit> Encode(
+            std::span<const std::uint8_t> nv12,
+            std::uint64_t presentationTimeUs,
+            bool forceKeyFrame)
+        {
+            auto sample = MakeNv12InputSample(nv12, presentationTimeUs);
+            return SubmitInputSample(sample.Get(), forceKeyFrame);
+        }
+
+        [[nodiscard]] std::vector<EncodedAccessUnit> EncodeBgra(
+            std::span<const std::uint8_t> bgra,
+            std::uint32_t sourceWidth,
+            std::uint32_t sourceHeight,
+            std::size_t sourceStride,
+            std::uint32_t clockwiseQuarterTurns,
+            std::uint64_t presentationTimeUs,
+            bool forceKeyFrame)
+        {
+            if (hardware && !gpuBgraFailed)
+            {
+                try
+                {
+                    ConvertBgraOnGpu(
+                        bgra, sourceWidth, sourceHeight, sourceStride, clockwiseQuarterTurns);
+                }
+                catch (const std::exception& exception)
+                {
+                    gpuBgraFailed = true;
+                    gpuBgraConversion = false;
+                    bgraConversionName = std::string("CPU fallback: ") + exception.what();
+                    videoContext.Reset();
+                    videoProcessor.Reset();
+                    videoProcessorEnumerator.Reset();
+                    bgraInputView.Reset();
+                    nv12OutputView.Reset();
+                    bgraInputTexture.Reset();
+                }
+                if (!gpuBgraFailed)
+                {
+                    auto sample = MakeSampleFromBuffer(hardwareInputBuffer.Get(), presentationTimeUs);
+                    return SubmitInputSample(sample.Get(), forceKeyFrame);
+                }
+            }
+
+            std::span<const std::uint8_t> oriented = bgra;
+            std::uint32_t convertedWidth = sourceWidth;
+            std::uint32_t convertedHeight = sourceHeight;
+            std::size_t convertedStride = sourceStride;
+            if (clockwiseQuarterTurns != 0)
+            {
+                tabletdisplay::video::RotateBgra(
+                    bgra,
+                    sourceWidth,
+                    sourceHeight,
+                    sourceStride,
+                    clockwiseQuarterTurns,
+                    cpuRotatedBgra);
+                convertedWidth = (clockwiseQuarterTurns & 1U) != 0 ? sourceHeight : sourceWidth;
+                convertedHeight = (clockwiseQuarterTurns & 1U) != 0 ? sourceWidth : sourceHeight;
+                convertedStride = static_cast<std::size_t>(convertedWidth) * 4U;
+                oriented = cpuRotatedBgra;
+            }
+            if (convertedWidth != options.width || convertedHeight != options.height)
+                throw std::invalid_argument("BGRA dimensions do not match encoder configuration");
+            tabletdisplay::video::BgraToNv12(
+                oriented, convertedWidth, convertedHeight, convertedStride, cpuNv12);
+            auto sample = MakeNv12InputSample(cpuNv12, presentationTimeUs);
+            return SubmitInputSample(sample.Get(), forceKeyFrame);
         }
 
         [[nodiscard]] std::vector<EncodedAccessUnit> Drain()
@@ -564,11 +788,25 @@ namespace tabletdisplay::host
         ComPtr<IMFDXGIDeviceManager> deviceManager;
         ComPtr<ID3D11Texture2D> hardwareInputTexture;
         ComPtr<IMFMediaBuffer> hardwareInputBuffer;
+        ComPtr<ID3D11VideoContext> videoContext;
+        ComPtr<ID3D11VideoProcessorEnumerator> videoProcessorEnumerator;
+        ComPtr<ID3D11VideoProcessor> videoProcessor;
+        ComPtr<ID3D11Texture2D> bgraInputTexture;
+        ComPtr<ID3D11VideoProcessorInputView> bgraInputView;
+        ComPtr<ID3D11VideoProcessorOutputView> nv12OutputView;
+        std::vector<std::uint8_t> cpuRotatedBgra;
+        std::vector<std::uint8_t> cpuNv12;
         std::optional<tabletdisplay::video::H264CodecConfig> config;
         std::string name;
+        std::string bgraConversionName{ "CPU BGRA->NV12" };
+        std::uint32_t bgraInputWidth{};
+        std::uint32_t bgraInputHeight{};
+        std::uint32_t bgraRotation{};
         DWORD inputId{};
         DWORD outputId{};
         bool hardware{};
+        bool gpuBgraConversion{};
+        bool gpuBgraFailed{};
         bool asynchronous{};
         std::uint32_t pendingNeedInput{};
         std::uint32_t pendingHaveOutput{};
@@ -591,6 +829,25 @@ namespace tabletdisplay::host
         return m_impl->Encode(nv12, presentationTimeUs, forceKeyFrame);
     }
 
+    std::vector<EncodedAccessUnit> MediaFoundationH264Encoder::EncodeBgra(
+        std::span<const std::uint8_t> bgra,
+        std::uint32_t sourceWidth,
+        std::uint32_t sourceHeight,
+        std::size_t sourceStride,
+        std::uint32_t clockwiseQuarterTurns,
+        std::uint64_t presentationTimeUs,
+        bool forceKeyFrame)
+    {
+        return m_impl->EncodeBgra(
+            bgra,
+            sourceWidth,
+            sourceHeight,
+            sourceStride,
+            clockwiseQuarterTurns,
+            presentationTimeUs,
+            forceKeyFrame);
+    }
+
     std::vector<EncodedAccessUnit> MediaFoundationH264Encoder::Drain()
     {
         return m_impl->Drain();
@@ -604,6 +861,16 @@ namespace tabletdisplay::host
     bool MediaFoundationH264Encoder::IsHardware() const noexcept
     {
         return m_impl->hardware;
+    }
+
+    bool MediaFoundationH264Encoder::UsesGpuBgraConversion() const noexcept
+    {
+        return m_impl->gpuBgraConversion;
+    }
+
+    const std::string& MediaFoundationH264Encoder::BgraConversionName() const noexcept
+    {
+        return m_impl->bgraConversionName;
     }
 
     const tabletdisplay::video::H264CodecConfig* MediaFoundationH264Encoder::CodecConfig() const noexcept

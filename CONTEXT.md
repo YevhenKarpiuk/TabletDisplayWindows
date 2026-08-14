@@ -8,11 +8,11 @@ Windows-часть системы, превращающей Android-планше
 - Транспорт: `adb forward tcp:27183 tcp:27183`, protocol v1 из `doc/PROTOCOL.md`.
 - Инструменты: VS 2022 + WDK/Spectre; portable WDK 10.0.26100.6584, Android SDK и FFmpeg 9.0.1 в `C:\tools`.
 - Команды: `build.cmd`, `test.cmd`, `install-driver.cmd`, `check-driver.cmd`, `uninstall-driver.cmd`, `virtual-stream.cmd`, `release.cmd`.
-- Готово: test-signed IddCx `ROOT\DISPLAY\0000`; latest-frame IOCTL; автоматический режим 1280×800@60; конвейер capture/BGRA→NV12/encode; ADB TCP; двунаправленный protocol v1; single-touch → Windows mouse.
+- Готово: test-signed IddCx `ROOT\DISPLAY\0000`; latest-frame IOCTL; автоматический режим 1280×800@60; D3D11 VideoProcessor BGRA→NV12/rotation с zero-copy NV12→Quick Sync; ADB TCP; двунаправленный protocol v1; single-touch → Windows mouse.
 - Lenovo TB-X606F: поток @60 отображается аппаратным `OMX.MTK.VIDEO.DECODER.AVC`; Windows использует realtime/low-latency Intel Quick Sync H.264, Android — полукадровый render pacing.
 - `stream.cmd` требует обычный интерактивный Windows-сеанс; Desktop Duplication недоступен из service/sandbox.
 - IddCx: test-signed пакет установлен при включённом Secure Boot; `ROOT\DISPLAY\0000` и дочерний монитор запущены без ошибок, monitor container GUID стабилен. Test Mode не нужен.
 - Проверено на `HA15VXDN`: 1280×800 и 800×1280 @60, tap/drag, mouse-up и reconnect; аппаратные encoder/decoder и tests проходят. Host поворачивает raw IddCx-кадр без смены режима; исправлена COM-утечка output samples Quick Sync, 60-секундный soak стабилен (~96 МБ private).
 - Release 0.1.1: test-signed driver ZIP с `Install.cmd`/`Uninstall.cmd`, portable tray Host с bundled ADB и Android release APK; общий значок в `assets`/Android mipmap.
-- Далее: длительный soak-тест и GPU zero-copy/shared texture.
+- Далее: длительный soak-тест; затем shared texture driver→Host для устранения CPU readback/upload BGRA.
 - Подробный план: [doc/IMPLEMENTATION_PLAN.md](doc/IMPLEMENTATION_PLAN.md).

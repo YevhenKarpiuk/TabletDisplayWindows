@@ -1025,7 +1025,7 @@ namespace
             std::mutex mutex;
             std::condition_variable ready;
             std::condition_variable empty;
-            std::vector<std::uint8_t> nv12;
+            tabletdisplay::host::CapturedFrame frame;
             bool occupied{};
             bool finished{};
             bool stop{};
@@ -1033,7 +1033,6 @@ namespace
         } slot;
 
         std::chrono::nanoseconds captureTime{};
-        std::chrono::nanoseconds conversionTime{};
         std::chrono::nanoseconds encodingTime{};
         std::chrono::nanoseconds sendTime{};
         std::chrono::nanoseconds maximumProducerWork{};
@@ -1046,8 +1045,7 @@ namespace
         {
             try
             {
-                std::vector<std::uint8_t> prepared;
-                std::vector<std::uint8_t> orientedBgra;
+                auto prepared = std::move(frame);
                 auto nextCaptureTime = streamStarted;
                 for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
                 {
@@ -1055,7 +1053,6 @@ namespace
                         std::unique_lock lock(slot.mutex);
                         slot.empty.wait(lock, [&] { return !slot.occupied || slot.stop; });
                         if (slot.stop) return;
-                        prepared.swap(slot.nv12);
                     }
 
                     if (frameIndex != 0)
@@ -1073,12 +1070,10 @@ namespace
                     const auto producerWorkStarted = Clock::now();
                     if (frameIndex != 0)
                     {
-                        tabletdisplay::host::CapturedFrame latest{};
                         const auto captureStarted = Clock::now();
-                        if (capture.Capture(latest, 0))
+                        if (capture.Capture(prepared, 0))
                         {
-                            frame = std::move(latest);
-                            if (frame.width != rawWidth || frame.height != rawHeight)
+                            if (prepared.width != rawWidth || prepared.height != rawHeight)
                             {
                                 throw std::runtime_error(
                                     "The virtual display mode changed during streaming; restart virtual-stream.cmd");
@@ -1086,30 +1081,6 @@ namespace
                         }
                         captureTime += Clock::now() - captureStarted;
                     }
-
-                    const auto conversionStarted = Clock::now();
-                    if (orientation == DMDO_DEFAULT)
-                    {
-                        tabletdisplay::video::BgraToNv12(
-                            frame.bgra, frame.width, frame.height, frame.stride, prepared);
-                    }
-                    else
-                    {
-                        tabletdisplay::video::RotateBgra(
-                            frame.bgra,
-                            frame.width,
-                            frame.height,
-                            frame.stride,
-                            orientation,
-                            orientedBgra);
-                        tabletdisplay::video::BgraToNv12(
-                            orientedBgra,
-                            width,
-                            height,
-                            static_cast<std::size_t>(width) * 4U,
-                            prepared);
-                    }
-                    conversionTime += Clock::now() - conversionStarted;
                     maximumProducerWork = std::max(
                         maximumProducerWork,
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1118,7 +1089,7 @@ namespace
                     {
                         std::lock_guard lock(slot.mutex);
                         if (slot.stop) return;
-                        slot.nv12.swap(prepared);
+                        slot.frame = prepared;
                         slot.occupied = true;
                     }
                     slot.ready.notify_one();
@@ -1137,8 +1108,9 @@ namespace
             slot.ready.notify_one();
         });
 
-        std::vector<std::uint8_t> nv12;
+        tabletdisplay::host::CapturedFrame bgraFrame;
         std::uint64_t submittedFrames{};
+        bool conversionReported{};
         try
         {
             for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
@@ -1152,17 +1124,31 @@ namespace
                     });
                     if (slot.failure) std::rethrow_exception(slot.failure);
                     if (!slot.occupied) break;
-                    nv12.swap(slot.nv12);
-                    slot.occupied = false;
+                    bgraFrame = slot.frame;
                 }
-                slot.empty.notify_one();
 
                 const auto consumerWorkStarted = Clock::now();
                 const auto ptsUs = frameIndex * 1'000'000ULL / fps;
                 const auto encodingStarted = Clock::now();
-                const auto encodedFrames = encoder.Encode(
-                    nv12, ptsUs, frameIndex == 0 || forceKeyFrame.exchange(false));
+                const auto encodedFrames = encoder.EncodeBgra(
+                    bgraFrame.bgra,
+                    bgraFrame.width,
+                    bgraFrame.height,
+                    bgraFrame.stride,
+                    orientation,
+                    ptsUs,
+                    frameIndex == 0 || forceKeyFrame.exchange(false));
                 encodingTime += Clock::now() - encodingStarted;
+                {
+                    std::lock_guard lock(slot.mutex);
+                    slot.occupied = false;
+                }
+                slot.empty.notify_one();
+                if (!conversionReported)
+                {
+                    std::cout << "BGRA conversion: " << encoder.BgraConversionName() << '\n';
+                    conversionReported = true;
+                }
                 const auto sendStarted = Clock::now();
                 for (const auto& encoded : encodedFrames)
                     sendEncoded(encoded);
@@ -1228,8 +1214,9 @@ namespace
             << "Pipeline timing: "
             << std::chrono::duration<double>(streamElapsed).count() << " s loop, avg/frame "
             << averageMilliseconds(captureTime) << " ms capture, "
-            << averageMilliseconds(conversionTime) << " ms BGRA->NV12, "
-            << averageMilliseconds(encodingTime) << " ms encode, "
+            << averageMilliseconds(encodingTime) << " ms "
+            << (encoder.UsesGpuBgraConversion() ? "GPU" : "CPU fallback")
+            << " convert/encode, "
             << averageMilliseconds(sendTime) << " ms send; max producer "
             << std::chrono::duration<double, std::milli>(maximumProducerWork).count()
             << " ms, max encode/send "
