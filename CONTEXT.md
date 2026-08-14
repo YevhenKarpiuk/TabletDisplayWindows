@@ -9,7 +9,7 @@ Windows-часть системы, превращающей Android-планше
 - Инструменты: VS 2022 + WDK/Spectre; portable WDK 10.0.26100.6584, Android SDK и FFmpeg 9.0.1 в `C:\tools`.
 - Команды: `build.cmd`, `test.cmd`, `install-driver.cmd`, `check-driver.cmd`, `uninstall-driver.cmd`, `virtual-stream.cmd`, `release.cmd`.
 - Готово: test-signed IddCx `ROOT\DISPLAY\0000`; latest-frame IOCTL; автоматический режим 1280×800@60; конвейер capture/BGRA→NV12/encode; ADB TCP; двунаправленный protocol v1; single-touch → Windows mouse.
-- Lenovo TB-X606F: поток виртуального дисплея 1280×800@60 отображается аппаратным `OMX.MTK.VIDEO.DECODER.AVC`; Windows кодирует Intel Quick Sync H.264, Android синхронизирует вывод через одно-кадровый pacing.
+- Lenovo TB-X606F: поток @60 отображается аппаратным `OMX.MTK.VIDEO.DECODER.AVC`; Windows использует realtime/low-latency Intel Quick Sync H.264, Android — полукадровый render pacing.
 - `stream.cmd` требует обычный интерактивный Windows-сеанс; Desktop Duplication недоступен из service/sandbox.
 - IddCx: test-signed пакет установлен при включённом Secure Boot; `ROOT\DISPLAY\0000` и дочерний монитор запущены без ошибок, monitor container GUID стабилен. Test Mode не нужен.
 - Проверено на `HA15VXDN`: 1280×800 и 800×1280 @60, tap/drag, mouse-up и reconnect; аппаратные encoder/decoder и tests проходят. Host поворачивает raw IddCx-кадр без смены режима; исправлена COM-утечка output samples Quick Sync, 60-секундный soak стабилен (~96 МБ private).

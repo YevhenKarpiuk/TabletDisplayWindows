@@ -270,11 +270,14 @@ namespace tabletdisplay::host
             }
             (void)transform.As(&codec);
 
+            SetCodecBool(codec.Get(), CODECAPI_AVEncCommonLowLatency, true);
+            SetCodecBool(codec.Get(), CODECAPI_AVEncCommonRealTime, true);
             SetCodecBool(codec.Get(), CODECAPI_AVLowLatencyMode, true);
             SetCodecUint32(codec.Get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
             SetCodecUint32(codec.Get(), CODECAPI_AVEncCommonMeanBitRate, options.bitrate);
             SetCodecUint32(codec.Get(), CODECAPI_AVEncMPVGOPSize, std::max<std::uint32_t>(1, options.fps * 2U));
             SetCodecUint32(codec.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+            SetCodecUint32(codec.Get(), CODECAPI_AVEncVideoMaxNumRefFrame, 1);
 
             ComPtr<IMFMediaType> outputType;
             CheckHr(MFCreateMediaType(&outputType), "MFCreateMediaType(output)");
