@@ -854,16 +854,32 @@ namespace
         ConfigureTabletDisplayMode(width, height, fps);
         tabletdisplay::host::IddFrameCapture capture;
         tabletdisplay::host::CapturedFrame frame{};
-        const auto modeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while ((frame.width != width || frame.height != height) &&
-            std::chrono::steady_clock::now() < modeDeadline)
+        const auto waitForExpectedFrame = [&]()
         {
-            (void)capture.Capture(frame, 500);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while ((frame.width != width || frame.height != height) &&
+                std::chrono::steady_clock::now() < deadline)
+            {
+                (void)capture.Capture(frame, 500);
+            }
+            return frame.width == width && frame.height == height;
+        };
+        if (!waitForExpectedFrame())
+        {
+            // Updating an IddCx driver can leave Windows with the requested mode selected but
+            // without a compositor swap-chain. Cycling through another advertised mode forces
+            // DWM to create a fresh swap-chain without requiring a reboot or manual Settings UI.
+            std::cout << "Refreshing the TabletDisplay swap-chain...\n";
+            ConfigureTabletDisplayMode(1920, 1200, 60);
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            frame = {};
+            ConfigureTabletDisplayMode(width, height, fps);
         }
-        if (frame.width != width || frame.height != height)
+        if (!waitForExpectedFrame())
         {
             throw std::runtime_error(
-                "No 1280x800 IddCx frame is available. Select 'Extend these displays' in Windows display settings");
+                "No 1280x800 IddCx frame is available after refreshing the display mode. "
+                "Select 'Extend these displays' in Windows display settings");
         }
         tabletdisplay::host::MediaFoundationH264Encoder encoder({
             width, height, fps, bitrate, true });
