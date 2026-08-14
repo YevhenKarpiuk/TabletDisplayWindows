@@ -307,6 +307,21 @@ int main(int argc, char* argv[])
         Check(whiteNv12 == std::vector<std::uint8_t>({ 235, 235, 235, 235, 128, 128 }),
             "BGRA white to NV12");
 
+        const std::vector<std::uint8_t> rotationSource{
+            1, 0, 0, 255, 2, 0, 0, 255, 3, 0, 0, 255,
+            4, 0, 0, 255, 5, 0, 0, 255, 6, 0, 0, 255
+        };
+        std::vector<std::uint8_t> rotated;
+        tabletdisplay::video::RotateBgra(rotationSource, 3, 2, 12, 1, rotated);
+        Check(rotated.size() == rotationSource.size() &&
+            rotated[0] == 4 && rotated[4] == 1 && rotated[8] == 5 &&
+            rotated[12] == 2 && rotated[16] == 6 && rotated[20] == 3,
+            "BGRA clockwise rotation");
+        tabletdisplay::video::RotateBgra(rotationSource, 3, 2, 12, 3, rotated);
+        Check(rotated[0] == 3 && rotated[4] == 6 && rotated[8] == 2 &&
+            rotated[12] == 5 && rotated[16] == 1 && rotated[20] == 4,
+            "BGRA counter-clockwise rotation");
+
         const std::vector<std::uint8_t> lengthPrefixed{
             0, 0, 0, 2, 0x65, 0xAA,
             0, 0, 0, 2, 0x41, 0xBB

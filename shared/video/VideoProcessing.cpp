@@ -1,6 +1,7 @@
 #include "video/VideoProcessing.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -148,6 +149,59 @@ namespace tabletdisplay::video
                 uvRow[column] = ClampByte(((-38 * red - 74 * green + 112 * blue + 128) >> 8) + 128);
                 uvRow[column + 1U] = ClampByte(((112 * red - 94 * green - 18 * blue + 128) >> 8) + 128);
             }
+        }
+    }
+
+    void RotateBgra(
+        std::span<const std::uint8_t> bgra,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::size_t stride,
+        std::uint32_t clockwiseQuarterTurns,
+        std::vector<std::uint8_t>& rotated)
+    {
+        if (width == 0 || height == 0 || clockwiseQuarterTurns > 3)
+            throw std::invalid_argument("Invalid BGRA rotation");
+        if (stride < static_cast<std::size_t>(width) * 4U ||
+            static_cast<std::size_t>(height) > std::numeric_limits<std::size_t>::max() / stride ||
+            bgra.size() < stride * height)
+            throw std::invalid_argument("BGRA buffer is too small");
+
+        const auto outputWidth = (clockwiseQuarterTurns & 1U) != 0 ? height : width;
+        const auto outputHeight = (clockwiseQuarterTurns & 1U) != 0 ? width : height;
+        rotated.resize(static_cast<std::size_t>(outputWidth) * outputHeight * 4U);
+        const auto copyPixel = [&](std::uint32_t sourceX, std::uint32_t sourceY,
+                                   std::uint32_t destinationX, std::uint32_t destinationY)
+        {
+            const auto* sourceRow = bgra.data() + static_cast<std::size_t>(sourceY) * stride;
+            auto* destination = rotated.data() +
+                (static_cast<std::size_t>(destinationY) * outputWidth + destinationX) * 4U;
+            memcpy(destination, sourceRow + static_cast<std::size_t>(sourceX) * 4U, 4U);
+        };
+        if (clockwiseQuarterTurns == 0)
+        {
+            const auto rowBytes = static_cast<std::size_t>(width) * 4U;
+            for (std::uint32_t row = 0; row < height; ++row)
+                memcpy(rotated.data() + static_cast<std::size_t>(row) * rowBytes,
+                    bgra.data() + static_cast<std::size_t>(row) * stride, rowBytes);
+        }
+        else if (clockwiseQuarterTurns == 1)
+        {
+            for (std::uint32_t sourceY = 0; sourceY < height; ++sourceY)
+            for (std::uint32_t sourceX = 0; sourceX < width; ++sourceX)
+                copyPixel(sourceX, sourceY, height - 1U - sourceY, sourceX);
+        }
+        else if (clockwiseQuarterTurns == 2)
+        {
+            for (std::uint32_t sourceY = 0; sourceY < height; ++sourceY)
+            for (std::uint32_t sourceX = 0; sourceX < width; ++sourceX)
+                copyPixel(sourceX, sourceY, width - 1U - sourceX, height - 1U - sourceY);
+        }
+        else
+        {
+            for (std::uint32_t sourceY = 0; sourceY < height; ++sourceY)
+            for (std::uint32_t sourceX = 0; sourceX < width; ++sourceX)
+                copyPixel(sourceX, sourceY, sourceY, width - 1U - sourceX);
         }
     }
 

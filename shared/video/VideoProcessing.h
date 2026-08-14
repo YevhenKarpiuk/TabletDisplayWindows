@@ -26,6 +26,13 @@ namespace tabletdisplay::video
         std::uint32_t height,
         std::size_t stride,
         std::vector<std::uint8_t>& nv12);
+    void RotateBgra(
+        std::span<const std::uint8_t> bgra,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::size_t stride,
+        std::uint32_t clockwiseQuarterTurns,
+        std::vector<std::uint8_t>& rotated);
 
     [[nodiscard]] bool HasAnnexBStartCode(std::span<const std::uint8_t> bytes) noexcept;
     [[nodiscard]] bool AnnexBContainsNalType(

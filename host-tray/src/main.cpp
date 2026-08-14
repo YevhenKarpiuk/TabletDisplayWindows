@@ -140,7 +140,7 @@ namespace
         const auto menu = CreatePopupMenu();
         if (!menu) return;
         const auto exitText = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_UKRAINIAN
-            ? L"Вихід"
+            ? L"\u0412\u0438\u0445\u0456\u0434"
             : L"Exit";
         (void)AppendMenuW(menu, MF_STRING, kExitCommand, exitText);
         POINT point{};

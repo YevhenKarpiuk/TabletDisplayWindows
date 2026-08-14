@@ -1,6 +1,6 @@
 # План реализации TabletDisplayWindows
 
-> Статус 2026-08-14: виртуальный дисплей поддерживает ландшафтный 1280×800 и портретный 800×1280 режимы @60; реализованы Intel Quick Sync H.264, frame pacing и асинхронный single-touch → Windows mouse. Следующий шаг — длительный reconnect/soak-тест, затем GPU zero-copy.
+> Статус 2026-08-14: сквозным тестом подтверждены 1280×800 и портретный 800×1280 @60; Host поворачивает raw IddCx-кадр без перебора видеорежимов. Реализованы Intel Quick Sync H.264, frame pacing и асинхронный single-touch → Windows mouse. Следующий шаг — длительный reconnect/soak-тест, затем GPU zero-copy.
 
 ## 1. Цель и границы MVP
 

@@ -217,7 +217,7 @@ namespace
         throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
     }
 
-    [[nodiscard]] bool TabletDisplayUsesPortraitOrientation()
+    [[nodiscard]] DWORD TabletDisplayOrientation()
     {
         DISPLAY_DEVICEW device{};
         device.cb = sizeof(device);
@@ -229,9 +229,9 @@ namespace
                 mode.dmSize = sizeof(mode);
                 if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0))
                     throw std::runtime_error("Cannot query the TabletDisplay orientation");
-                return mode.dmDisplayOrientation == DMDO_90 ||
-                    mode.dmDisplayOrientation == DMDO_270 ||
-                    mode.dmPelsHeight > mode.dmPelsWidth;
+                if (mode.dmDisplayOrientation > DMDO_270)
+                    throw std::runtime_error("Windows reported an invalid TabletDisplay orientation");
+                return mode.dmDisplayOrientation;
             }
             device = {};
             device.cb = sizeof(device);
@@ -870,42 +870,37 @@ namespace
 
     void RunVirtualDisplayStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
     {
-        const bool portrait = TabletDisplayUsesPortraitOrientation();
+        const auto orientation = TabletDisplayOrientation();
+        const bool portrait = orientation == DMDO_90 || orientation == DMDO_270;
         const std::uint16_t width = portrait ? 800 : 1280;
         const std::uint16_t height = portrait ? 1280 : 800;
-        const std::uint16_t refreshWidth = portrait ? 1200 : 1920;
-        const std::uint16_t refreshHeight = portrait ? 1920 : 1200;
+        const std::uint16_t rawWidth = portrait ? height : width;
+        const std::uint16_t rawHeight = portrait ? width : height;
         constexpr std::uint16_t fps = 60;
         constexpr std::uint32_t bitrate = 8'000'000;
         ConfigureTabletDisplayMode(width, height, fps);
         tabletdisplay::host::IddFrameCapture capture;
         tabletdisplay::host::CapturedFrame frame{};
-        const auto waitForExpectedFrame = [&]()
+        const auto waitForFrame = [&]()
         {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while ((frame.width != width || frame.height != height) &&
-                std::chrono::steady_clock::now() < deadline)
+            while (frame.width == 0 && std::chrono::steady_clock::now() < deadline)
             {
                 (void)capture.Capture(frame, 500);
             }
-            return frame.width == width && frame.height == height;
+            return frame.width != 0;
         };
-        if (!waitForExpectedFrame())
-        {
-            // Updating an IddCx driver can leave Windows with the requested mode selected but
-            // without a compositor swap-chain. Cycling through another advertised mode forces
-            // DWM to create a fresh swap-chain without requiring a reboot or manual Settings UI.
-            std::cout << "Refreshing the TabletDisplay swap-chain...\n";
-            ConfigureTabletDisplayMode(refreshWidth, refreshHeight, fps);
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            frame = {};
-            ConfigureTabletDisplayMode(width, height, fps);
-        }
-        if (!waitForExpectedFrame())
+        if (!waitForFrame())
         {
             throw std::runtime_error(
                 "No IddCx frame is available in the requested TabletDisplay orientation. "
                 "Select 'Extend these displays' in Windows display settings");
+        }
+        std::cout << "IddCx raw frame: " << frame.width << 'x' << frame.height << '\n';
+        if (frame.width != rawWidth || frame.height != rawHeight)
+        {
+            throw std::runtime_error(
+                "IddCx frame size does not match the Windows display orientation");
         }
         tabletdisplay::host::MediaFoundationH264Encoder encoder({
             width, height, fps, bitrate, true });
@@ -1052,6 +1047,7 @@ namespace
             try
             {
                 std::vector<std::uint8_t> prepared;
+                std::vector<std::uint8_t> orientedBgra;
                 auto nextCaptureTime = streamStarted;
                 for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
                 {
@@ -1067,6 +1063,12 @@ namespace
                         nextCaptureTime += frameDuration;
                         std::this_thread::sleep_until(nextCaptureTime);
                     }
+                    if (frameIndex != 0 && frameIndex % fps == 0 &&
+                        TabletDisplayOrientation() != orientation)
+                    {
+                        throw std::runtime_error(
+                            "The virtual display orientation changed; reconnecting the stream");
+                    }
 
                     const auto producerWorkStarted = Clock::now();
                     if (frameIndex != 0)
@@ -1076,7 +1078,7 @@ namespace
                         if (capture.Capture(latest, 0))
                         {
                             frame = std::move(latest);
-                            if (frame.width != width || frame.height != height)
+                            if (frame.width != rawWidth || frame.height != rawHeight)
                             {
                                 throw std::runtime_error(
                                     "The virtual display mode changed during streaming; restart virtual-stream.cmd");
@@ -1086,8 +1088,27 @@ namespace
                     }
 
                     const auto conversionStarted = Clock::now();
-                    tabletdisplay::video::BgraToNv12(
-                        frame.bgra, frame.width, frame.height, frame.stride, prepared);
+                    if (orientation == DMDO_DEFAULT)
+                    {
+                        tabletdisplay::video::BgraToNv12(
+                            frame.bgra, frame.width, frame.height, frame.stride, prepared);
+                    }
+                    else
+                    {
+                        tabletdisplay::video::RotateBgra(
+                            frame.bgra,
+                            frame.width,
+                            frame.height,
+                            frame.stride,
+                            orientation,
+                            orientedBgra);
+                        tabletdisplay::video::BgraToNv12(
+                            orientedBgra,
+                            width,
+                            height,
+                            static_cast<std::size_t>(width) * 4U,
+                            prepared);
+                    }
                     conversionTime += Clock::now() - conversionStarted;
                     maximumProducerWork = std::max(
                         maximumProducerWork,
