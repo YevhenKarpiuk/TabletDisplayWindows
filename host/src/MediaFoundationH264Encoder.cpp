@@ -442,7 +442,18 @@ namespace tabletdisplay::host
             }
             CheckHr(hr, "ProcessOutput");
 
-            ComPtr<IMFSample> sample = output.pSample;
+            ComPtr<IMFSample> sample;
+            if (allocatedSample && output.pSample == allocatedSample.Get())
+            {
+                sample = std::move(allocatedSample);
+            }
+            else
+            {
+                // ProcessOutput transfers ownership of an MFT-provided sample to the caller.
+                // Constructing ComPtr from the raw pointer would AddRef it and leak one sample
+                // (and its backing video surface) for every encoded frame.
+                sample.Attach(output.pSample);
+            }
             if (!sample) throw std::runtime_error("H.264 MFT returned no output sample");
             ComPtr<IMFMediaBuffer> buffer;
             CheckHr(sample->ConvertToContiguousBuffer(&buffer), "ConvertToContiguousBuffer");
