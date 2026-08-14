@@ -202,13 +202,36 @@ namespace
                 const auto testResult = ChangeDisplaySettingsExW(
                     device.DeviceName, &mode, nullptr, CDS_TEST, nullptr);
                 if (testResult != DISP_CHANGE_SUCCESSFUL)
-                    throw std::runtime_error("Windows rejected the 1280x800 @ 60 Hz TabletDisplay mode");
+                    throw std::runtime_error("Windows rejected the requested TabletDisplay mode");
                 const auto applyResult = ChangeDisplaySettingsExW(
                     device.DeviceName, &mode, nullptr, CDS_UPDATEREGISTRY, nullptr);
                 if (applyResult != DISP_CHANGE_SUCCESSFUL)
-                    throw std::runtime_error("Windows could not apply the 1280x800 @ 60 Hz TabletDisplay mode");
-                std::cout << "Windows display mode: 1280x800 @ 60 Hz\n";
+                    throw std::runtime_error("Windows could not apply the requested TabletDisplay mode");
+                std::cout << "Windows display mode: " << width << 'x' << height
+                    << " @ " << frequency << " Hz\n";
                 return;
+            }
+            device = {};
+            device.cb = sizeof(device);
+        }
+        throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+    }
+
+    [[nodiscard]] bool TabletDisplayUsesPortraitOrientation()
+    {
+        DISPLAY_DEVICEW device{};
+        device.cb = sizeof(device);
+        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
+        {
+            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display")
+            {
+                DEVMODEW mode{};
+                mode.dmSize = sizeof(mode);
+                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0))
+                    throw std::runtime_error("Cannot query the TabletDisplay orientation");
+                return mode.dmDisplayOrientation == DMDO_90 ||
+                    mode.dmDisplayOrientation == DMDO_270 ||
+                    mode.dmPelsHeight > mode.dmPelsWidth;
             }
             device = {};
             device.cb = sizeof(device);
@@ -847,8 +870,11 @@ namespace
 
     void RunVirtualDisplayStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
     {
-        constexpr std::uint16_t width = 1280;
-        constexpr std::uint16_t height = 800;
+        const bool portrait = TabletDisplayUsesPortraitOrientation();
+        const std::uint16_t width = portrait ? 800 : 1280;
+        const std::uint16_t height = portrait ? 1280 : 800;
+        const std::uint16_t refreshWidth = portrait ? 1200 : 1920;
+        const std::uint16_t refreshHeight = portrait ? 1920 : 1200;
         constexpr std::uint16_t fps = 60;
         constexpr std::uint32_t bitrate = 8'000'000;
         ConfigureTabletDisplayMode(width, height, fps);
@@ -870,7 +896,7 @@ namespace
             // without a compositor swap-chain. Cycling through another advertised mode forces
             // DWM to create a fresh swap-chain without requiring a reboot or manual Settings UI.
             std::cout << "Refreshing the TabletDisplay swap-chain...\n";
-            ConfigureTabletDisplayMode(1920, 1200, 60);
+            ConfigureTabletDisplayMode(refreshWidth, refreshHeight, fps);
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             frame = {};
             ConfigureTabletDisplayMode(width, height, fps);
@@ -878,7 +904,7 @@ namespace
         if (!waitForExpectedFrame())
         {
             throw std::runtime_error(
-                "No 1280x800 IddCx frame is available after refreshing the display mode. "
+                "No IddCx frame is available in the requested TabletDisplay orientation. "
                 "Select 'Extend these displays' in Windows display settings");
         }
         tabletdisplay::host::MediaFoundationH264Encoder encoder({

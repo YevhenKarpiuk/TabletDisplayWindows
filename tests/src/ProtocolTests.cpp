@@ -266,7 +266,7 @@ int main(int argc, char* argv[])
         Check(argc == 2, "usage: TabletDisplayProtocolTests <golden-directory>");
         const std::filesystem::path directory(argv[1]);
         const auto cases = LoadManifest(directory);
-        Check(cases.size() == 13, "unexpected vector count");
+        Check(cases.size() == 14, "unexpected vector count");
 
         for (const auto& vectorCase : cases)
         {
@@ -336,10 +336,12 @@ int main(int argc, char* argv[])
         Check(frameRequest.structureBytes == sizeof(frameRequest), "frame IPC request layout");
         Check(frameHeader.magic == tabletdisplay::ipc::kFrameMagic &&
             frameHeader.headerBytes == sizeof(frameHeader), "frame IPC response layout");
-        Check(tabletdisplay::ipc::kMaxFrameBytes == 1920U * 1200U * 4U,
+        Check(tabletdisplay::ipc::kMaxFrameWidth == 1920U &&
+            tabletdisplay::ipc::kMaxFrameHeight == 1920U &&
+            tabletdisplay::ipc::kMaxFrameBytes == 1920U * 1200U * 4U,
             "frame IPC byte limit");
 
-        std::cout << "TabletDisplay protocol: 13 golden vectors, H.264, pixel and frame IPC passed\n";
+        std::cout << "TabletDisplay protocol: 14 golden vectors, H.264, pixel and frame IPC passed\n";
         return 0;
     }
     catch (const std::exception& exception)

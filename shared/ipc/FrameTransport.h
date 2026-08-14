@@ -18,10 +18,10 @@ namespace tabletdisplay::ipc
     inline constexpr std::uint16_t kFrameVersionMinor = 0;
     inline constexpr std::uint32_t kPixelFormatBgra8 = 1;
     inline constexpr std::uint32_t kMaxFrameWidth = 1920;
-    inline constexpr std::uint32_t kMaxFrameHeight = 1200;
+    inline constexpr std::uint32_t kMaxFrameHeight = 1920;
     inline constexpr std::uint32_t kBytesPerPixel = 4;
     inline constexpr std::uint32_t kMaxFrameBytes =
-        kMaxFrameWidth * kMaxFrameHeight * kBytesPerPixel;
+        1920U * 1200U * kBytesPerPixel;
 
     struct FrameRequest
     {

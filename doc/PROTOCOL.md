@@ -148,7 +148,7 @@ Capabilities:
 | 24 | 4 | `csd_length` |
 | 28 | N | SPS/PPS в Annex B |
 
-`payload_length == 28 + csd_length`. CSD начинается с трёх- или четырёхбайтного Annex B start code и содержит SPS/PPS. MVP допускает только 1280×800 и 1920×1200 при 30/1 или 60/1 FPS.
+`payload_length == 28 + csd_length`. CSD начинается с трёх- или четырёхбайтного Annex B start code и содержит SPS/PPS. Допускаются ландшафтные режимы 1280×800 и 1920×1200, а также их портретные варианты 800×1280 и 1200×1920 при 30/1 или 60/1 FPS.
 
 ### 5.5 VIDEO_FRAME
 

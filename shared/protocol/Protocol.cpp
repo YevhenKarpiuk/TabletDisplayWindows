@@ -314,7 +314,9 @@ namespace tabletdisplay::protocol
             Require(ReadLe<std::uint32_t>(payload, 0) != 0 &&
                 ReadLe<std::uint32_t>(payload, 4) != 0, "VIDEO_CONFIG ids");
             Require((width == 1280 && height == 800) ||
-                (width == 1920 && height == 1200), "VIDEO_CONFIG mode");
+                (width == 800 && height == 1280) ||
+                (width == 1920 && height == 1200) ||
+                (width == 1200 && height == 1920), "VIDEO_CONFIG mode");
             Require((fpsNumerator == 30 || fpsNumerator == 60) &&
                 fpsDenominator == 1, "VIDEO_CONFIG fps");
             Require(profile == 66 || profile == 77 || profile == 100, "VIDEO_CONFIG profile");

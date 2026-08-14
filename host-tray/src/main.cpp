@@ -139,7 +139,10 @@ namespace
     {
         const auto menu = CreatePopupMenu();
         if (!menu) return;
-        (void)AppendMenuW(menu, MF_STRING, kExitCommand, L"Вихід / Exit");
+        const auto exitText = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_UKRAINIAN
+            ? L"Вихід"
+            : L"Exit";
+        (void)AppendMenuW(menu, MF_STRING, kExitCommand, exitText);
         POINT point{};
         (void)GetCursorPos(&point);
         (void)SetForegroundWindow(window);

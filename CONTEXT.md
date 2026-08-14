@@ -3,7 +3,7 @@
 Windows-часть системы, превращающей Android-планшет в дополнительный монитор Windows 11 по USB/ADB.
 
 - Парный проект: `C:\Users\ka\Documents\kotlin\TabletDisplayAndroid`.
-- MVP: один виртуальный дисплей 1280×800/1920×1200, 30/60 Гц, H.264, single-touch → мышь.
+- MVP: один виртуальный дисплей 1280×800/1920×1200 или 800×1280/1200×1920, 30/60 Гц, H.264, single-touch → мышь.
 - Стек: C++20, UMDF 2/IddCx, D3D11/DXGI, Media Foundation, Winsock, MSBuild/WDK.
 - Транспорт: `adb forward tcp:27183 tcp:27183`, protocol v1 из `doc/PROTOCOL.md`.
 - Инструменты: VS 2022 + WDK/Spectre; portable WDK 10.0.26100.6584, Android SDK и FFmpeg 9.0.1 в `C:\tools`.

@@ -7,6 +7,7 @@ video_frame	video_frame.hex	W2A	VALID	0x0011	0x0007	41	3
 request_keyframe	request_keyframe.hex	A2W	VALID	0x0012	0x0001	24	3
 touch	touch.hex	A2W	VALID	0x0020	0x0001	32	4
 ping	ping.hex	W2A	VALID	0x0030	0x0001	16	4
+video_config_portrait	video_config_portrait.hex	W2A	VALID	0x0010	0x0001	52	5
 pong	pong.hex	A2W	VALID	0x0031	0x0001	24	5
 error	error.hex	A2W	VALID	0x00FF	0x0001	37	6
 oversized	oversized.hex	NONE	PAYLOAD_TOO_LARGE	0x0011	0x0001	8388641	5
