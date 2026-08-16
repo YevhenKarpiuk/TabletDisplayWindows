@@ -13,6 +13,6 @@ Windows-часть системы, превращающей Android-планше
 - `stream.cmd` требует обычный интерактивный Windows-сеанс; Desktop Duplication недоступен из service/sandbox.
 - IddCx: test-signed пакет установлен при включённом Secure Boot; `ROOT\DISPLAY\0000` и дочерний монитор запущены без ошибок, monitor container GUID стабилен. Test Mode не нужен.
 - Проверено на `HA15VXDN`: 1280×800 и 800×1280 @60, tap/drag, reconnect, аппаратные encoder/decoder. Shared-texture поток 60 секунд стабилен (~112,5 МБ private); CPU fallback работает после штатного выхода и аварийного завершения Host.
-- Release 0.1.4: test-signed driver ZIP с `Install.cmd`/`Uninstall.cmd`, portable tray Host с bundled ADB, динамическим монитором, автозапуском текущего пользователя и остановкой потока при выключении дисплеев Windows; Android release APK 0.1.2.
+- Release 0.1.5: test-signed driver ZIP с `Install.cmd`/`Uninstall.cmd`, portable tray Host с bundled ADB, динамическим монитором, мягким отсоединением display path и восстановлением taskbar-регистрации окон после monitor departure, автозапуском текущего пользователя и остановкой потока при выключении дисплеев Windows; Android release APK 0.1.2.
 - Далее: субъективная проверка задержки и длительный (60 минут) soak/reconnect; затем выпуск обновлённого release-комплекта.
 - Подробный план: [doc/IMPLEMENTATION_PLAN.md](doc/IMPLEMENTATION_PLAN.md).

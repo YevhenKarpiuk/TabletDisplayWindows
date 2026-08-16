@@ -123,6 +123,18 @@ namespace
         (void)SendInput(1, &input, sizeof(input));
     }
 
+    void RestoreTaskbarWindowRegistration() noexcept
+    {
+        (void)EnumWindows(
+            [](HWND window, LPARAM) -> BOOL
+            {
+                if (IsWindowVisible(window) && GetWindow(window, GW_OWNER) == nullptr)
+                    (void)ShowWindowAsync(window, SW_SHOWNA);
+                return TRUE;
+            },
+            0);
+    }
+
     void CloseHostHandles() noexcept
     {
         if (g_hostProcess.hThread)
@@ -141,16 +153,25 @@ namespace
 
     void StopHost() noexcept
     {
+        bool stoppedRunningHost{};
         if (g_hostProcess.hProcess)
         {
             if (WaitForSingleObject(g_hostProcess.hProcess, 0) == WAIT_TIMEOUT)
             {
+                stoppedRunningHost = true;
                 (void)TerminateProcess(g_hostProcess.hProcess, 0);
                 (void)WaitForSingleObject(g_hostProcess.hProcess, 5'000);
             }
             CloseHostHandles();
         }
         ReleaseTabletMouseButton();
+        if (stoppedRunningHost)
+        {
+            Sleep(100);
+            RestoreTaskbarWindowRegistration();
+            Sleep(250);
+            RestoreTaskbarWindowRegistration();
+        }
     }
 
     bool StartHost(HWND owner)

@@ -1,4 +1,4 @@
-TabletDisplay Host Portable 0.1.4
+TabletDisplay Host Portable 0.1.5
 
 UK
 - Підключіть Android-планшет з увімкненим USB debugging.

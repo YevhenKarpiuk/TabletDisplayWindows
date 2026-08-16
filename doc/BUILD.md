@@ -51,7 +51,7 @@ virtual-stream.cmd [--serial SERIAL] [--seconds N]
 ## Текущее состояние
 
 - Driver — IddCx-база Microsoft IddSample; monitor lease управляет arrival/departure, а swap-chain выдаётся Host через shared-texture или latest-frame IOCTL.
-- Host 0.1.4 — ADB/session, динамический monitor lease после Android-handshake, DXGI/IddCx capture, GPU/CPU NV12 conversion, Media Foundation H.264, protocol sender, tray-настройка автозапуска и отключение потока при выключении дисплеев Windows.
+- Host 0.1.5 — ADB/session, динамический monitor lease после Android-handshake, мягкое отсоединение display path и повторная taskbar-регистрация окон после monitor departure, DXGI/IddCx capture, GPU/CPU NV12 conversion, Media Foundation H.264, protocol sender, tray-настройка автозапуска и отключение потока при выключении дисплеев Windows.
 - Software H264 MFT проверен FFmpeg (Constrained Baseline 1280×800) и планшетом: 150/150 кадров, аппаратный MTK decoder.
 - Intel Quick Sync MFT обнаружен; hardware output будет активирован с прямым GPU frame path от IddCx.
 - Песочница/служба не имеет права `IDXGIOutput1::DuplicateOutput`; `stream.cmd` запускается как обычное пользовательское приложение.

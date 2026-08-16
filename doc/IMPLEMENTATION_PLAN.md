@@ -234,6 +234,7 @@ TabletDisplayWindows/
 - различное расположение виртуального монитора слева/справа/выше основного;
 - lock/unlock, sleep/wake, display mode change;
 - cable unplug, Android force-stop, `adb kill-server`, host restart;
+- после monitor departure окна и значки активных программ остаются доступными на основном taskbar;
 - статический текст, прокрутка, видео и быстрое перемещение окон.
 
 ## 6. Метрики MVP

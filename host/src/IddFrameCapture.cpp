@@ -157,6 +157,79 @@ namespace tabletdisplay::host
             throw std::runtime_error(
                 "TabletDisplay frame interface is unavailable; reinstall the current driver package");
         }
+
+        [[nodiscard]] bool FindAttachedTabletDisplay(
+            std::wstring* deviceName = nullptr,
+            DWORD* stateFlags = nullptr) noexcept
+        {
+            for (DWORD index = 0;; ++index)
+            {
+                DISPLAY_DEVICEW display{};
+                display.cb = sizeof(display);
+                if (!EnumDisplayDevicesW(nullptr, index, &display, 0))
+                    return false;
+                if (wcscmp(display.DeviceString, L"TabletDisplay Virtual Display") != 0 ||
+                    (display.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0)
+                {
+                    continue;
+                }
+                if (deviceName != nullptr) *deviceName = display.DeviceName;
+                if (stateFlags != nullptr) *stateFlags = display.StateFlags;
+                return true;
+            }
+        }
+
+        void PrepareTabletDisplayForDeparture() noexcept
+        {
+            std::wstring deviceName;
+            DWORD stateFlags{};
+            if (!FindAttachedTabletDisplay(&deviceName, &stateFlags) ||
+                (stateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0)
+            {
+                return;
+            }
+
+            // Detach the display path first, without changing the saved display layout.
+            // This gives Explorer and applications a normal WM_DISPLAYCHANGE before the
+            // IddCx monitor object disappears, so taskbar/window ownership can migrate.
+            DEVMODEW detachedMode{};
+            detachedMode.dmSize = sizeof(detachedMode);
+            detachedMode.dmFields = DM_POSITION;
+            detachedMode.dmPelsWidth = 0;
+            detachedMode.dmPelsHeight = 0;
+            if (ChangeDisplaySettingsExW(
+                    deviceName.c_str(),
+                    &detachedMode,
+                    nullptr,
+                    0,
+                    nullptr) != DISP_CHANGE_SUCCESSFUL)
+            {
+                return;
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::seconds(2);
+            while (FindAttachedTabletDisplay() &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+        }
+
+        void RestoreTaskbarWindowRegistration() noexcept
+        {
+            // Windows 11 can keep the windows alive but drop their taskbar buttons
+            // after a display path disappears. Re-showing already visible top-level
+            // windows without activation makes Explorer register the buttons again.
+            (void)EnumWindows(
+                [](HWND window, LPARAM) -> BOOL
+                {
+                    if (IsWindowVisible(window) && GetWindow(window, GW_OWNER) == nullptr)
+                        (void)ShowWindowAsync(window, SW_SHOWNA);
+                    return TRUE;
+                },
+                0);
+        }
     }
 
     struct IddFrameCapture::Impl
@@ -186,22 +259,23 @@ namespace tabletdisplay::host
             }
             if (monitorConnected)
             {
-                tabletdisplay::ipc::MonitorConnectionRequest request{};
-                DWORD returnedBytes{};
-                (void)DeviceIoControl(
-                    device.get(),
-                    tabletdisplay::ipc::kSetMonitorConnectionIoctl,
-                    &request,
-                    static_cast<DWORD>(sizeof(request)),
-                    nullptr,
-                    0,
-                    &returnedBytes,
-                    nullptr);
+                try
+                {
+                    SetMonitorConnected(false);
+                }
+                catch (...)
+                {
+                    // Closing the WDF file object is the final monitor-lease fallback.
+                }
             }
         }
 
         void SetMonitorConnected(bool connected)
         {
+            const auto wasConnected = monitorConnected;
+            if (!connected && wasConnected)
+                PrepareTabletDisplayForDeparture();
+
             tabletdisplay::ipc::MonitorConnectionRequest request{};
             request.connected = connected ? 1U : 0U;
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -234,6 +308,15 @@ namespace tabletdisplay::host
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
             monitorConnected = connected;
+            if (!connected && wasConnected)
+            {
+                // IddCx departure and Explorer's taskbar update are asynchronous.
+                // A short second pass covers both the path detach and object removal.
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                RestoreTaskbarWindowRegistration();
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                RestoreTaskbarWindowRegistration();
+            }
             lastSequence = 0;
             lastSharedSequence = 0;
             lastSharedGeneration = 0;
