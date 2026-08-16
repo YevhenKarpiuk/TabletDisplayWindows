@@ -132,6 +132,7 @@ extern "C" DRIVER_INITIALIZE DriverEntry;
 
 EVT_WDF_DRIVER_DEVICE_ADD IddSampleDeviceAdd;
 EVT_WDF_DEVICE_D0_ENTRY IddSampleDeviceD0Entry;
+EVT_WDF_FILE_CLEANUP IddSampleFileCleanup;
 EVT_IDD_CX_DEVICE_IO_CONTROL IddSampleDeviceIoControl;
 
 EVT_IDD_CX_ADAPTER_INIT_FINISHED IddSampleAdapterInitFinished;
@@ -242,6 +243,17 @@ NTSTATUS IddSampleDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT pDeviceInit)
     {
         return Status;
     }
+
+    WDF_FILEOBJECT_CONFIG FileConfig;
+    WDF_FILEOBJECT_CONFIG_INIT(
+        &FileConfig,
+        WDF_NO_EVENT_CALLBACK,
+        WDF_NO_EVENT_CALLBACK,
+        IddSampleFileCleanup);
+    WdfDeviceInitSetFileObjectConfig(
+        pDeviceInit,
+        &FileConfig,
+        WDF_NO_OBJECT_ATTRIBUTES);
 
     WDF_OBJECT_ATTRIBUTES Attr;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectDeviceContextWrapper);
@@ -952,9 +964,15 @@ void SwapChainProcessor::RunCore()
 #pragma region IndirectDeviceContext
 
 IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
-    m_WdfDevice(WdfDevice), m_Frames(make_shared<FrameStore>())
+    m_WdfDevice(WdfDevice),
+    m_Adapter{},
+    m_Monitor{},
+    m_Frames(make_shared<FrameStore>()),
+    m_MonitorLeaseFile{},
+    m_MonitorConnected{},
+    m_AdapterReady{},
+    m_ConnectorIndex{}
 {
-    m_Adapter = {};
 }
 
 IndirectDeviceContext::~IndirectDeviceContext()
@@ -984,6 +1002,77 @@ NTSTATUS IndirectDeviceContext::CopySharedFrame(
 NTSTATUS IndirectDeviceContext::SetFrameTransport(UINT mode, UINT64 generation)
 {
     return m_Frames->SetTransport(mode, generation);
+}
+
+NTSTATUS IndirectDeviceContext::SetMonitorConnection(
+    WDFFILEOBJECT fileObject,
+    bool connected)
+{
+    if (fileObject == nullptr)
+        return STATUS_INVALID_HANDLE;
+
+    lock_guard lock(m_MonitorMutex);
+    if (!m_AdapterReady)
+        return STATUS_DEVICE_NOT_READY;
+
+    if (connected)
+    {
+        if (m_MonitorLeaseFile != nullptr && m_MonitorLeaseFile != fileObject)
+            return STATUS_DEVICE_BUSY;
+
+        if (!m_MonitorConnected)
+        {
+            if (m_Monitor == nullptr)
+            {
+                const auto Status = CreateMonitorLocked();
+                if (!NT_SUCCESS(Status))
+                    return Status;
+            }
+            if (m_Monitor == nullptr)
+                return STATUS_DEVICE_NOT_READY;
+            IDARG_OUT_MONITORARRIVAL ArrivalOut{};
+            const auto Status = IddCxMonitorArrival(m_Monitor, &ArrivalOut);
+            if (!NT_SUCCESS(Status))
+            {
+                WdfObjectDelete(m_Monitor);
+                m_Monitor = nullptr;
+                return Status;
+            }
+            m_MonitorConnected = true;
+        }
+        m_MonitorLeaseFile = fileObject;
+        return STATUS_SUCCESS;
+    }
+
+    if (m_MonitorLeaseFile == nullptr)
+        return STATUS_SUCCESS;
+    if (m_MonitorLeaseFile != fileObject)
+        return STATUS_ACCESS_DENIED;
+
+    if (m_MonitorConnected)
+    {
+        const auto Status = IddCxMonitorDeparture(m_Monitor);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        m_MonitorConnected = false;
+        m_Monitor = nullptr;
+    }
+    m_MonitorLeaseFile = nullptr;
+    return STATUS_SUCCESS;
+}
+
+void IndirectDeviceContext::ReleaseMonitorConnection(WDFFILEOBJECT fileObject) noexcept
+{
+    lock_guard lock(m_MonitorMutex);
+    if (fileObject == nullptr || m_MonitorLeaseFile != fileObject)
+        return;
+
+    if (m_MonitorConnected && NT_SUCCESS(IddCxMonitorDeparture(m_Monitor)))
+    {
+        m_MonitorConnected = false;
+        m_Monitor = nullptr;
+    }
+    m_MonitorLeaseFile = nullptr;
 }
 
 void IndirectDeviceContext::InitAdapter()
@@ -1042,6 +1131,14 @@ void IndirectDeviceContext::InitAdapter()
 
 void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 {
+    lock_guard lock(m_MonitorMutex);
+    m_ConnectorIndex = ConnectorIndex;
+    m_AdapterReady = true;
+}
+
+NTSTATUS IndirectDeviceContext::CreateMonitorLocked()
+{
+
     // ==============================
     // TODO: In a real driver, the EDID should be retrieved dynamically from a connected physical monitor. The EDIDs
     // provided here are purely for demonstration.
@@ -1052,16 +1149,22 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
 
     WDF_OBJECT_ATTRIBUTES Attr;
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&Attr, IndirectMonitorContextWrapper);
+    Attr.EvtCleanupCallback = [](WDFOBJECT Object)
+    {
+        auto* Context = WdfObjectGet_IndirectMonitorContextWrapper(Object);
+        if (Context != nullptr)
+            Context->Cleanup();
+    };
 
-    // In the sample driver, we report a monitor right away but a real driver would do this when a monitor connection event occurs
+    // Each Host lease gets a fresh IddCx monitor object; the stable container ID preserves monitor identity.
     IDDCX_MONITOR_INFO MonitorInfo = {};
     MonitorInfo.Size = sizeof(MonitorInfo);
     MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-    MonitorInfo.ConnectorIndex = ConnectorIndex;
+    MonitorInfo.ConnectorIndex = m_ConnectorIndex;
 
     MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
     MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    if (ConnectorIndex >= ARRAYSIZE(s_SampleMonitors))
+    if (m_ConnectorIndex >= ARRAYSIZE(s_SampleMonitors))
     {
         MonitorInfo.MonitorDescription.DataSize = 0;
         MonitorInfo.MonitorDescription.pData = nullptr;
@@ -1069,11 +1172,10 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
     else
     {
         MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
-        MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_SampleMonitors[ConnectorIndex].pEdidBlock);
+        MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_SampleMonitors[m_ConnectorIndex].pEdidBlock);
     }
 
-    // This monitor is permanently attached to the virtual adapter, so its identity must
-    // remain stable across driver restarts and Windows reboots.
+    // The same tablet display reconnects repeatedly, so its identity must remain stable.
     MonitorInfo.MonitorContainerId = TABLET_DISPLAY_MONITOR_CONTAINER_ID;
 
     IDARG_IN_MONITORCREATE MonitorCreate = {};
@@ -1090,11 +1192,9 @@ void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
         pMonitorContextWrapper->pContext = new IndirectMonitorContext(
             MonitorCreateOut.MonitorObject,
             m_Frames);
-
-        // Tell the OS that the monitor has been plugged in
-        IDARG_OUT_MONITORARRIVAL ArrivalOut;
-        Status = IddCxMonitorArrival(MonitorCreateOut.MonitorObject, &ArrivalOut);
+        m_Monitor = MonitorCreateOut.MonitorObject;
     }
+    return Status;
 }
 
 IndirectMonitorContext::IndirectMonitorContext(
@@ -1284,8 +1384,56 @@ VOID IddSampleDeviceIoControl(
             }
         }
     }
+    else if (IoControlCode == tabletdisplay::ipc::kSetMonitorConnectionIoctl)
+    {
+        tabletdisplay::ipc::MonitorConnectionRequest* ConnectionRequest = nullptr;
+        if (InputBufferLength < sizeof(*ConnectionRequest))
+        {
+            Status = STATUS_BUFFER_TOO_SMALL;
+        }
+        else
+        {
+            Status = WdfRequestRetrieveInputBuffer(
+                Request,
+                sizeof(*ConnectionRequest),
+                reinterpret_cast<void**>(&ConnectionRequest),
+                nullptr);
+            if (NT_SUCCESS(Status) &&
+                (ConnectionRequest->structureBytes != sizeof(*ConnectionRequest) ||
+                 ConnectionRequest->connected > 1 ||
+                 ConnectionRequest->reserved != 0))
+            {
+                Status = STATUS_INVALID_PARAMETER;
+            }
+            if (NT_SUCCESS(Status))
+            {
+                auto* DeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+                const auto FileObject = WdfRequestGetFileObject(Request);
+                if (DeviceContext == nullptr || DeviceContext->pContext == nullptr ||
+                    FileObject == nullptr)
+                {
+                    Status = STATUS_DEVICE_NOT_READY;
+                }
+                else
+                {
+                    Status = DeviceContext->pContext->SetMonitorConnection(
+                        FileObject,
+                        ConnectionRequest->connected != 0);
+                }
+            }
+        }
+    }
 
     WdfRequestCompleteWithInformation(Request, Status, BytesWritten);
+}
+
+_Use_decl_annotations_
+VOID IddSampleFileCleanup(WDFFILEOBJECT FileObject)
+{
+    const auto Device = WdfFileObjectGetDevice(FileObject);
+    auto* DeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+    if (DeviceContext != nullptr && DeviceContext->pContext != nullptr)
+        DeviceContext->pContext->ReleaseMonitorConnection(FileObject);
 }
 
 _Use_decl_annotations_

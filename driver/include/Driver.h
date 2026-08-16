@@ -13,6 +13,7 @@
 #include <wrl.h>
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -169,11 +170,21 @@ namespace Microsoft
                 size_t outputBytes,
                 size_t* bytesWritten);
             NTSTATUS SetFrameTransport(UINT mode, UINT64 generation);
+            NTSTATUS SetMonitorConnection(WDFFILEOBJECT fileObject, bool connected);
+            void ReleaseMonitorConnection(WDFFILEOBJECT fileObject) noexcept;
 
         protected:
+            NTSTATUS CreateMonitorLocked();
+
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
+            IDDCX_MONITOR m_Monitor;
             std::shared_ptr<FrameStore> m_Frames;
+            std::mutex m_MonitorMutex;
+            WDFFILEOBJECT m_MonitorLeaseFile;
+            bool m_MonitorConnected;
+            bool m_AdapterReady;
+            UINT m_ConnectorIndex;
         };
 
         class IndirectMonitorContext

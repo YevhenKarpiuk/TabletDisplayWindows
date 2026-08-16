@@ -30,6 +30,7 @@ namespace tabletdisplay::host
         [[nodiscard]] bool Capture(CapturedFrame& frame, std::uint32_t timeoutMs);
         [[nodiscard]] bool ProbeShared(SharedCapturedFrame& frame, std::uint32_t timeoutMs);
         [[nodiscard]] bool CaptureShared(SharedCapturedFrame& frame, std::uint32_t timeoutMs);
+        void SetMonitorConnected(bool connected);
         void SetSharedTransport(bool enabled, std::uint64_t generation = 0);
         [[nodiscard]] bool UsesSharedTransport() const noexcept;
 

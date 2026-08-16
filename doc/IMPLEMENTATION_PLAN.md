@@ -1,6 +1,6 @@
 # План реализации TabletDisplayWindows
 
-> Статус 2026-08-14: реализован полный GPU-путь driver→Host→Quick Sync, CPU IOCTL fallback и автоматическое восстановление после падения Host. Tray поддерживает локализованный переключатель автозапуска через HKCU и останавливает поток при выключении дисплеев Windows, чтобы планшет становился чёрным; после пробуждения Host запускается автоматически. На `HA15VXDN` пройдены 60-секундный soak (~112,5 МБ private), штатный и аварийный fallback. Следующий шаг — 60-минутный soak/reconnect.
+> Статус 2026-08-16: реализован полный GPU-путь driver→Host→Quick Sync, CPU IOCTL fallback и динамический monitor lease: виртуальный монитор прибывает только после Android-handshake и убывает при разрыве либо закрытии Host handle. Tray поддерживает локализованный автозапуск и останавливает поток при выключении дисплеев Windows. На `HA15VXDN` пройдены 60-секундный soak (~112,5 МБ private), штатный и аварийный fallback. Следующий шаг — 60-минутный soak/reconnect.
 
 ## 1. Цель и границы MVP
 
@@ -41,11 +41,12 @@ TabletDisplayAndroid
 
 Реализованная схема IPC:
 
-- device interface с read-only IOCTL;
+- device interface с frame/transport/monitor-lease IOCTL, доступными обычному пользователю по read-access ACL;
 - основной путь — именованная D3D11 BGRA-текстура на render adapter, NT handle и keyed mutex;
 - Host открывает ресурс на том же adapter, поворачивает и преобразует BGRA→NV12 через D3D11 VideoProcessor;
 - совместимый latest-frame BGRA IOCTL/staging path остаётся fallback для старого Host или ошибки GPU IPC;
 - heartbeat автоматически возвращает драйвер к CPU-публикации после аварийного завершения Host;
+- monitor lease привязан к Host device handle: `IddCxMonitorArrival` выполняется после Android-handshake, а `IddCxMonitorDeparture` — при разрыве или WDF file cleanup;
 - отсутствие потребителя не должно блокировать callback или swap-chain processing драйвера.
 
 Device interface доступен обычному пользователю только на чтение. Имя shared resource случайное; жизненный цикл и поколения ресурса контролируются драйвером.

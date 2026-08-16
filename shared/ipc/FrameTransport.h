@@ -85,6 +85,13 @@ namespace tabletdisplay::ipc
         std::uint64_t generation{};
     };
 
+    struct MonitorConnectionRequest
+    {
+        std::uint32_t structureBytes{ sizeof(MonitorConnectionRequest) };
+        std::uint32_t connected{};
+        std::uint64_t reserved{};
+    };
+
     inline constexpr ULONG kGetLatestFrameIoctl = CTL_CODE(
         FILE_DEVICE_UNKNOWN,
         0x800,
@@ -100,10 +107,16 @@ namespace tabletdisplay::ipc
         0x802,
         METHOD_BUFFERED,
         FILE_READ_ACCESS);
+    inline constexpr ULONG kSetMonitorConnectionIoctl = CTL_CODE(
+        FILE_DEVICE_UNKNOWN,
+        0x803,
+        METHOD_BUFFERED,
+        FILE_READ_ACCESS);
 
     static_assert(sizeof(FrameRequest) == 16);
     static_assert(sizeof(FrameResponseHeader) == 64);
     static_assert(sizeof(SharedFrameRequest) == 24);
     static_assert(sizeof(SharedFrameResponse) == 256);
     static_assert(sizeof(FrameTransportRequest) == 16);
+    static_assert(sizeof(MonitorConnectionRequest) == 16);
 }

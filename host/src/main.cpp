@@ -185,7 +185,8 @@ namespace
         device.cb = sizeof(device);
         for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
         {
-            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display")
+            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display" &&
+                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
             {
                 DEVMODEW mode{};
                 mode.dmSize = sizeof(mode);
@@ -223,7 +224,8 @@ namespace
         device.cb = sizeof(device);
         for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
         {
-            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display")
+            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display" &&
+                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
             {
                 DEVMODEW mode{};
                 mode.dmSize = sizeof(mode);
@@ -237,6 +239,24 @@ namespace
             device.cb = sizeof(device);
         }
         throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+    }
+
+    [[nodiscard]] DWORD WaitForTabletDisplayOrientation()
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            try
+            {
+                return TabletDisplayOrientation();
+            }
+            catch (const std::runtime_error&)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        throw std::runtime_error(
+            "TabletDisplay did not appear in the Windows desktop after the monitor connection request");
     }
 
     struct DisplayBounds
@@ -253,7 +273,8 @@ namespace
         device.cb = sizeof(device);
         for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
         {
-            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display")
+            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display" &&
+                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
             {
                 DEVMODEW mode{};
                 mode.dmSize = sizeof(mode);
@@ -870,7 +891,9 @@ namespace
 
     void RunVirtualDisplayStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
     {
-        const auto orientation = TabletDisplayOrientation();
+        tabletdisplay::host::IddFrameCapture capture;
+        capture.SetMonitorConnected(true);
+        const auto orientation = WaitForTabletDisplayOrientation();
         const bool portrait = orientation == DMDO_90 || orientation == DMDO_270;
         const std::uint16_t width = portrait ? 800 : 1280;
         const std::uint16_t height = portrait ? 1280 : 800;
@@ -879,7 +902,6 @@ namespace
         constexpr std::uint16_t fps = 60;
         constexpr std::uint32_t bitrate = 8'000'000;
         ConfigureTabletDisplayMode(width, height, fps);
-        tabletdisplay::host::IddFrameCapture capture;
         tabletdisplay::host::CapturedFrame frame{};
         const auto waitForFrame = [&]()
         {
@@ -1436,7 +1458,7 @@ int main(int argc, char* argv[])
         }
         if (command == "--version")
         {
-            std::cout << "TabletDisplayHost 0.1.3\n";
+            std::cout << "TabletDisplayHost 0.1.4\n";
             return 0;
         }
         if (command == "--check")

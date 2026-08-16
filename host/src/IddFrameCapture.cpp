@@ -184,6 +184,59 @@ namespace tabletdisplay::host
                     &returnedBytes,
                     nullptr);
             }
+            if (monitorConnected)
+            {
+                tabletdisplay::ipc::MonitorConnectionRequest request{};
+                DWORD returnedBytes{};
+                (void)DeviceIoControl(
+                    device.get(),
+                    tabletdisplay::ipc::kSetMonitorConnectionIoctl,
+                    &request,
+                    static_cast<DWORD>(sizeof(request)),
+                    nullptr,
+                    0,
+                    &returnedBytes,
+                    nullptr);
+            }
+        }
+
+        void SetMonitorConnected(bool connected)
+        {
+            tabletdisplay::ipc::MonitorConnectionRequest request{};
+            request.connected = connected ? 1U : 0U;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            DWORD error{};
+            for (;;)
+            {
+                DWORD returnedBytes{};
+                if (DeviceIoControl(
+                        device.get(),
+                        tabletdisplay::ipc::kSetMonitorConnectionIoctl,
+                        &request,
+                        static_cast<DWORD>(sizeof(request)),
+                        nullptr,
+                        0,
+                        &returnedBytes,
+                        nullptr))
+                {
+                    break;
+                }
+                error = GetLastError();
+                if (!connected ||
+                    (error != ERROR_NOT_READY && error != ERROR_RETRY) ||
+                    std::chrono::steady_clock::now() >= deadline)
+                {
+                    throw std::runtime_error(
+                        "Cannot change the TabletDisplay monitor connection, Windows error " +
+                        std::to_string(error) +
+                        "; reinstall the current driver package");
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            monitorConnected = connected;
+            lastSequence = 0;
+            lastSharedSequence = 0;
+            lastSharedGeneration = 0;
         }
 
         [[nodiscard]] bool Capture(CapturedFrame& frame, std::uint32_t timeoutMs)
@@ -379,6 +432,7 @@ namespace tabletdisplay::host
         std::uint64_t lastSharedSequence{};
         std::uint64_t lastSharedGeneration{};
         bool sharedTransport{};
+        bool monitorConnected{};
     };
 
     IddFrameCapture::IddFrameCapture() : m_impl(std::make_unique<Impl>()) {}
@@ -397,6 +451,11 @@ namespace tabletdisplay::host
     bool IddFrameCapture::CaptureShared(SharedCapturedFrame& frame, std::uint32_t timeoutMs)
     {
         return m_impl->CaptureShared(frame, timeoutMs, true);
+    }
+
+    void IddFrameCapture::SetMonitorConnected(bool connected)
+    {
+        m_impl->SetMonitorConnected(connected);
     }
 
     void IddFrameCapture::SetSharedTransport(bool enabled, std::uint64_t generation)
