@@ -1,0 +1,76 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build: debug x64",
+      "type": "process",
+      "command": "${workspaceFolder}\\build.cmd",
+      "args": [
+        "Debug"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "build: release x64",
+      "type": "process",
+      "command": "${workspaceFolder}\\build.cmd",
+      "args": [
+        "Release"
+      ],
+      "group": "build",
+      "problemMatcher": "$msCompile"
+    },
+    {
+      "label": "run: host check",
+      "type": "process",
+      "command": "${workspaceFolder}\\artifacts\\x64\\Debug\\host\\TabletDisplayHost.exe",
+      "args": [
+        "--check"
+      ],
+      "dependsOn": "build: debug x64",
+      "problemMatcher": []
+    },
+    {
+      "label": "run: USB handshake",
+      "type": "process",
+      "command": "${workspaceFolder}\\connect.cmd",
+      "dependsOn": "build: debug x64",
+      "problemMatcher": []
+    },
+    {
+      "label": "run: synthetic video demo",
+      "type": "process",
+      "command": "${workspaceFolder}\\demo.cmd",
+      "dependsOn": "build: debug x64",
+      "problemMatcher": []
+    },
+    {
+      "label": "run: Media Foundation encoder demo",
+      "type": "process",
+      "command": "${workspaceFolder}\\encoder-demo.cmd",
+      "dependsOn": "build: debug x64",
+      "problemMatcher": []
+    },
+    {
+      "label": "run: primary desktop stream",
+      "type": "process",
+      "command": "${workspaceFolder}\\stream.cmd",
+      "dependsOn": "build: debug x64",
+      "problemMatcher": []
+    },
+    {
+      "label": "test: protocol",
+      "type": "process",
+      "command": "${workspaceFolder}\\test.cmd",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": "$msCompile"
+    }
+  ]
+}
