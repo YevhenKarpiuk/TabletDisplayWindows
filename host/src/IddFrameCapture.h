@@ -43,6 +43,9 @@ namespace tabletdisplay::host
         void SetMonitorConnected(bool connected, MonitorModeRequest modes = {});
         void SetSharedTransport(bool enabled, std::uint64_t generation = 0);
         [[nodiscard]] bool UsesSharedTransport() const noexcept;
+        // Auto-reset event the driver signals after each new frame of the leased monitor, or
+        // null with an older driver; then frames have to be polled.
+        [[nodiscard]] HANDLE FrameEvent();
         // The zero-based driver monitor slot leased by the last connection request.
         [[nodiscard]] std::uint32_t MonitorSlot() const noexcept;
 

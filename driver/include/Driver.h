@@ -100,6 +100,7 @@ namespace Microsoft
                 size_t outputBytes,
                 size_t* bytesWritten);
             NTSTATUS SetTransport(UINT mode, UINT64 generation);
+            NTSTATUS CopyFrameEvent(void* output, size_t outputBytes, size_t* bytesWritten);
 
         private:
             bool CreateSharedTextureLocked(
@@ -117,6 +118,8 @@ namespace Microsoft
             tabletdisplay::ipc::SharedFrameResponse m_SharedFrame;
             UINT64 m_SharedGeneration{};
             UINT64 m_SharedHeartbeatMs{};
+            HANDLE m_FrameEvent{};
+            tabletdisplay::ipc::FrameEventResponse m_FrameEventName;
             bool m_SharedEnabled{};
         };
 
@@ -172,6 +175,11 @@ namespace Microsoft
                 size_t outputBytes,
                 size_t* bytesWritten);
             NTSTATUS SetFrameTransport(WDFFILEOBJECT fileObject, UINT mode, UINT64 generation);
+            NTSTATUS CopyFrameEvent(
+                WDFFILEOBJECT fileObject,
+                void* output,
+                size_t outputBytes,
+                size_t* bytesWritten);
             NTSTATUS SetMonitorConnection(
                 WDFFILEOBJECT fileObject,
                 bool connected,

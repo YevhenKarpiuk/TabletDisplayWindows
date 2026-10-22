@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -26,6 +27,8 @@ namespace
 {
     constexpr UINT kTrayMessage = WM_APP + 1;
     constexpr UINT kDevicesMessage = WM_APP + 2;
+    // wParam: bit mask of the monitors whose Hosts stopped; lParam: the stop worker id.
+    constexpr UINT kHostsStoppedMessage = WM_APP + 3;
     constexpr UINT kExitCommand = 1001;
     constexpr UINT kAutoStartCommand = 1002;
     // kResolutionCommandBase + 10 * monitor index + N selects that tablet's resolution
@@ -60,12 +63,21 @@ namespace
     };
 
     // The Host streaming one TabletDisplay monitor; serial is empty while the monitor is free.
+    // A stopping slot keeps its serial and stays reserved until its Host has exited, so a new
+    // Host never competes with the old one for the monitor lease or the adb forward port.
     struct HostSlot
     {
         std::wstring serial;
         PROCESS_INFORMATION process{};
         HANDLE stopEvent{};
         std::wstring stopEventName;
+        bool stopping{};
+    };
+
+    struct StoppingHost
+    {
+        DWORD index;
+        HANDLE process;
     };
 
     NOTIFYICONDATAW g_trayIcon{};
@@ -73,6 +85,9 @@ namespace
     std::mutex g_devicesMutex;
     std::vector<AdbDevice> g_devices;
     std::jthread g_deviceWatcher;
+    // Workers that wait for stopping Hosts, keyed by the id they post back to the window.
+    std::map<LPARAM, std::jthread> g_stopWorkers;
+    LPARAM g_nextStopWorker{};
     bool g_reportedMissingHost{};
     HANDLE g_instanceMutex{};
     HPOWERNOTIFY g_displayPowerNotification{};
@@ -475,34 +490,45 @@ namespace
         return host.process.hProcess && WaitForSingleObject(host.process.hProcess, 0) == WAIT_TIMEOUT;
     }
 
-    // Stops the Hosts of the selected monitors together, so several tablets take one timeout.
-    void StopHosts(const std::array<bool, kMaxMonitors>& selected) noexcept
+    // Signals the selected Hosts to stop and takes their process handles; the slots stay
+    // reserved (stopping) until FinishStoppingHosts has waited for the processes.
+    std::vector<StoppingHost> BeginStoppingHosts(const std::array<bool, kMaxMonitors>& selected)
     {
-        for (DWORD index = 0; index < kMaxMonitors; ++index)
-        {
-            // A graceful stop lets the Host end the stream and detach the monitor itself.
-            if (selected[index] && IsHostRunning(g_hosts[index]) && g_hosts[index].stopEvent)
-                (void)SetEvent(g_hosts[index].stopEvent);
-        }
-        bool terminatedRunningHost{};
-        const auto deadline = GetTickCount64() + 4'000;
+        std::vector<StoppingHost> stopping;
         for (DWORD index = 0; index < kMaxMonitors; ++index)
         {
             auto& host = g_hosts[index];
             if (!selected[index]) continue;
+            // A graceful stop lets the Host end the stream and detach the monitor itself.
+            if (IsHostRunning(host) && host.stopEvent) (void)SetEvent(host.stopEvent);
             if (host.process.hProcess)
             {
-                const auto now = GetTickCount64();
-                const auto wait = static_cast<DWORD>(deadline > now ? deadline - now : 0);
-                if (WaitForSingleObject(host.process.hProcess, wait) == WAIT_TIMEOUT)
-                {
-                    terminatedRunningHost = true;
-                    (void)TerminateProcess(host.process.hProcess, 0);
-                    (void)WaitForSingleObject(host.process.hProcess, 5'000);
-                }
-                CloseHostHandles(host);
+                stopping.push_back({ index, host.process.hProcess });
+                host.process.hProcess = nullptr;
             }
-            host.serial.clear();
+            CloseHostHandles(host);
+            host.stopping = !host.serial.empty();
+        }
+        return stopping;
+    }
+
+    // Waits for the Hosts together, so several tablets take one timeout, and terminates those
+    // that do not exit in time. Runs off the window thread except when the tray exits.
+    void FinishStoppingHosts(const std::vector<StoppingHost>& hosts) noexcept
+    {
+        bool terminatedRunningHost{};
+        const auto deadline = GetTickCount64() + 4'000;
+        for (const auto& host : hosts)
+        {
+            const auto now = GetTickCount64();
+            const auto wait = static_cast<DWORD>(deadline > now ? deadline - now : 0);
+            if (WaitForSingleObject(host.process, wait) == WAIT_TIMEOUT)
+            {
+                terminatedRunningHost = true;
+                (void)TerminateProcess(host.process, 0);
+                (void)WaitForSingleObject(host.process, 5'000);
+            }
+            CloseHandle(host.process);
         }
         if (terminatedRunningHost)
         {
@@ -515,11 +541,67 @@ namespace
         }
     }
 
-    void StopAllHosts() noexcept
+    // Stops the selected Hosts without blocking the tray; kHostsStoppedMessage frees their
+    // monitors afterwards.
+    void StopHosts(HWND window, const std::array<bool, kMaxMonitors>& selected)
+    {
+        WPARAM mask{};
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+        {
+            if (selected[index] && !g_hosts[index].stopping) mask |= WPARAM{ 1 } << index;
+        }
+        if (mask == 0) return;
+        std::array<bool, kMaxMonitors> starting{};
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+            starting[index] = (mask & (WPARAM{ 1 } << index)) != 0;
+        auto hosts = BeginStoppingHosts(starting);
+        const auto id = ++g_nextStopWorker;
+        g_stopWorkers.emplace(id, std::jthread([window, mask, id, hosts = std::move(hosts)]
+        {
+            FinishStoppingHosts(hosts);
+            (void)PostMessageW(window, kHostsStoppedMessage, mask, id);
+        }));
+    }
+
+    void StopAllHosts(HWND window)
     {
         std::array<bool, kMaxMonitors> all{};
         all.fill(true);
-        StopHosts(all);
+        StopHosts(window, all);
+    }
+
+    void HostsStopped(WPARAM mask, LPARAM id)
+    {
+        const auto worker = g_stopWorkers.find(id);
+        if (worker != g_stopWorkers.end())
+        {
+            if (worker->second.joinable()) worker->second.join();
+            g_stopWorkers.erase(worker);
+        }
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+        {
+            if ((mask & (WPARAM{ 1 } << index)) == 0) continue;
+            g_hosts[index].stopping = false;
+            g_hosts[index].serial.clear();
+        }
+    }
+
+    // Used when the tray exits: stops every Host before the process ends.
+    void StopAllHostsNow()
+    {
+        std::array<bool, kMaxMonitors> all{};
+        all.fill(true);
+        FinishStoppingHosts(BeginStoppingHosts(all));
+        for (auto& [id, worker] : g_stopWorkers)
+        {
+            if (worker.joinable()) worker.join();
+        }
+        g_stopWorkers.clear();
+        for (auto& host : g_hosts)
+        {
+            host.stopping = false;
+            host.serial.clear();
+        }
     }
 
     bool StartHost(HWND owner, DWORD monitor, const std::wstring& serial)
@@ -614,18 +696,18 @@ namespace
         for (DWORD index = 0; index < kMaxMonitors; ++index)
         {
             const auto& host = g_hosts[index];
-            if (!host.serial.empty() && find(host.serial) == devices.end())
+            if (!host.serial.empty() && !host.stopping && find(host.serial) == devices.end())
             {
                 unplugged[index] = true;
                 anyUnplugged = true;
             }
         }
-        if (anyUnplugged) StopHosts(unplugged);
+        if (anyUnplugged) StopHosts(window, unplugged);
 
         for (DWORD index = 0; index < kMaxMonitors; ++index)
         {
             auto& host = g_hosts[index];
-            if (host.serial.empty() || IsHostRunning(host)) continue;
+            if (host.serial.empty() || host.stopping || IsHostRunning(host)) continue;
             // The Host exited on its own (for example its watchdog fired): restart it.
             const auto serial = host.serial;
             (void)StartHost(window, index + 1, serial);
@@ -781,7 +863,7 @@ namespace
             if (wParam == WTS_SESSION_LOCK && !g_sessionLocked)
             {
                 g_sessionLocked = true;
-                StopAllHosts();
+                StopAllHosts(window);
             }
             else if (wParam == WTS_SESSION_UNLOCK && g_sessionLocked)
             {
@@ -790,6 +872,10 @@ namespace
             }
             return 0;
         case kDevicesMessage:
+            ReconcileHosts(window);
+            return 0;
+        case kHostsStoppedMessage:
+            HostsStopped(wParam, lParam);
             ReconcileHosts(window);
             return 0;
         case WM_POWERBROADCAST:
@@ -808,7 +894,7 @@ namespace
                         if (poweredOn)
                             ReconcileHosts(window);
                         else
-                            StopAllHosts();
+                            StopAllHosts(window);
                     }
                 }
                 return TRUE;
@@ -844,14 +930,15 @@ namespace
                 const DWORD divisor = (LOWORD(wParam) - kResolutionCommandBase) % kResolutionCommandStride;
                 const auto serial = g_hosts[index].serial;
                 if (divisor >= 1 && divisor <= kMaxResolutionDivisor && !serial.empty() &&
+                    !g_hosts[index].stopping &&
                     divisor != DeviceResolutionDivisor(serial) &&
                     SetDeviceResolutionDivisor(serial, divisor))
                 {
                     // The Host chooses the monitor mode when it connects, so restart only its Host.
                     std::array<bool, kMaxMonitors> selected{};
                     selected[index] = true;
-                    StopHosts(selected);
-                    ReconcileHosts(window);
+                    // ReconcileHosts starts the new Host once kHostsStoppedMessage frees the monitor.
+                    StopHosts(window, selected);
                 }
                 return 0;
             }
@@ -877,7 +964,7 @@ namespace
             }
             (void)Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
             if (g_trayIcon.hIcon) DestroyIcon(g_trayIcon.hIcon);
-            StopAllHosts();
+            StopAllHostsNow();
             if (g_deviceWatcher.joinable()) g_deviceWatcher.join();
             PostQuitMessage(0);
             return 0;

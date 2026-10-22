@@ -284,6 +284,8 @@ namespace tabletdisplay::host
 
             tabletdisplay::ipc::MonitorConnectionRequest request{};
             request.connected = connected ? 1U : 0U;
+            frameEvent.reset();
+            frameEventQueried = false;
             if (connected)
             {
                 request.nativeWidth = modes.nativeWidth;
@@ -555,7 +557,37 @@ namespace tabletdisplay::host
             lastSequence = header.sequence;
         }
 
+        [[nodiscard]] HANDLE FrameEvent()
+        {
+            if (!frameEventQueried)
+            {
+                frameEventQueried = true;
+                tabletdisplay::ipc::FrameEventResponse eventResponse{};
+                DWORD returnedBytes{};
+                if (DeviceIoControl(
+                        device.get(),
+                        tabletdisplay::ipc::kGetFrameEventIoctl,
+                        nullptr,
+                        0,
+                        &eventResponse,
+                        static_cast<DWORD>(sizeof(eventResponse)),
+                        &returnedBytes,
+                        nullptr) &&
+                    returnedBytes == sizeof(eventResponse) &&
+                    eventResponse.structureBytes == sizeof(eventResponse) &&
+                    eventResponse.nameLength > 0 &&
+                    eventResponse.nameLength < tabletdisplay::ipc::kSharedResourceNameChars &&
+                    eventResponse.name[eventResponse.nameLength] == L'\0')
+                {
+                    frameEvent.reset(OpenEventW(SYNCHRONIZE, FALSE, eventResponse.name));
+                }
+            }
+            return frameEvent.valid() ? frameEvent.get() : nullptr;
+        }
+
         WinHandle device;
+        WinHandle frameEvent;
+        bool frameEventQueried{};
         std::vector<std::uint8_t> response;
         std::vector<std::uint8_t> pixels;
         tabletdisplay::ipc::FrameResponseHeader header{};
@@ -598,6 +630,11 @@ namespace tabletdisplay::host
     bool IddFrameCapture::UsesSharedTransport() const noexcept
     {
         return m_impl->sharedTransport;
+    }
+
+    HANDLE IddFrameCapture::FrameEvent()
+    {
+        return m_impl->FrameEvent();
     }
 
     std::uint32_t IddFrameCapture::MonitorSlot() const noexcept

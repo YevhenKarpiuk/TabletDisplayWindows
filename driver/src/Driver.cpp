@@ -442,7 +442,10 @@ namespace
 {
     constexpr UINT64 SharedTransportHeartbeatTimeoutMs = 2'000;
 
-    bool MakeSharedResourceName(wchar_t* destination, size_t destinationChars)
+    bool MakeSharedResourceName(
+        wchar_t* destination,
+        size_t destinationChars,
+        const wchar_t* prefix = L"TabletDisplayFrame")
     {
         if (destination == nullptr || destinationChars == 0)
         {
@@ -460,7 +463,8 @@ namespace
         const int count = swprintf_s(
             destination,
             destinationChars,
-            L"Global\\TabletDisplayFrame-%08X-%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+            L"Global\\%ls-%08X-%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",
+            prefix,
             GetCurrentProcessId(),
             randomBytes[0], randomBytes[1], randomBytes[2], randomBytes[3],
             randomBytes[4], randomBytes[5], randomBytes[6], randomBytes[7],
@@ -473,6 +477,30 @@ namespace
 FrameStore::FrameStore()
 {
     InitializeSRWLock(&m_Lock);
+    m_FrameEventName = {};
+
+    // The Host only waits on the event: SYNCHRONIZE for interactive users, full access for
+    // the driver host. Without the event the Host falls back to polling.
+    wchar_t eventName[tabletdisplay::ipc::kSharedResourceNameChars] = {};
+    PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
+    if (MakeSharedResourceName(eventName, ARRAYSIZE(eventName), L"TabletDisplayFrameEvent") &&
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;0x100000;;;IU)",
+            SDDL_REVISION_1,
+            &securityDescriptor,
+            nullptr))
+    {
+        SECURITY_ATTRIBUTES securityAttributes = {};
+        securityAttributes.nLength = sizeof(securityAttributes);
+        securityAttributes.lpSecurityDescriptor = securityDescriptor;
+        m_FrameEvent = CreateEventW(&securityAttributes, FALSE, FALSE, eventName);
+        LocalFree(securityDescriptor);
+        if (m_FrameEvent != nullptr)
+        {
+            m_FrameEventName.nameLength = static_cast<UINT>(wcslen(eventName));
+            wcscpy_s(m_FrameEventName.name, eventName);
+        }
+    }
 }
 
 FrameStore::~FrameStore()
@@ -480,6 +508,22 @@ FrameStore::~FrameStore()
     AcquireSRWLockExclusive(&m_Lock);
     ResetSharedTextureLocked();
     ReleaseSRWLockExclusive(&m_Lock);
+    if (m_FrameEvent != nullptr)
+    {
+        CloseHandle(m_FrameEvent);
+        m_FrameEvent = nullptr;
+    }
+}
+
+NTSTATUS FrameStore::CopyFrameEvent(void* output, size_t outputBytes, size_t* bytesWritten)
+{
+    if (output == nullptr || bytesWritten == nullptr || outputBytes < sizeof(m_FrameEventName))
+        return STATUS_BUFFER_TOO_SMALL;
+    if (m_FrameEvent == nullptr)
+        return STATUS_NOT_SUPPORTED;
+    memcpy(output, &m_FrameEventName, sizeof(m_FrameEventName));
+    *bytesWritten = sizeof(m_FrameEventName);
+    return STATUS_SUCCESS;
 }
 
 void FrameStore::ResetSharedTextureLocked()
@@ -672,6 +716,8 @@ bool FrameStore::PublishShared(
     ++m_SharedFrame.sequence;
     m_SharedFrame.timestampUs = timestampUs;
     ReleaseSRWLockExclusive(&m_Lock);
+    if (m_FrameEvent != nullptr)
+        (void)SetEvent(m_FrameEvent);
     return true;
 }
 
@@ -786,6 +832,8 @@ bool FrameStore::Publish(
     ++m_Header.sequence;
     m_Header.timestampUs = timestampUs;
     ReleaseSRWLockExclusive(&m_Lock);
+    if (m_FrameEvent != nullptr)
+        (void)SetEvent(m_FrameEvent);
     return true;
 }
 
@@ -1125,6 +1173,18 @@ NTSTATUS IndirectDeviceContext::SetFrameTransport(
     if (!Frames)
         return STATUS_ACCESS_DENIED;
     return Frames->SetTransport(mode, generation);
+}
+
+NTSTATUS IndirectDeviceContext::CopyFrameEvent(
+    WDFFILEOBJECT fileObject,
+    void* output,
+    size_t outputBytes,
+    size_t* bytesWritten)
+{
+    const auto Frames = LeasedFrames(fileObject);
+    if (!Frames)
+        return STATUS_ACCESS_DENIED;
+    return Frames->CopyFrameEvent(output, outputBytes, bytesWritten);
 }
 
 // requestedSlot 0 leases the first free monitor, N leases monitor N - 1.
@@ -1539,6 +1599,38 @@ VOID IddSampleDeviceIoControl(
                         WdfRequestGetFileObject(Request),
                         TransportRequest->mode,
                         TransportRequest->generation);
+                }
+            }
+        }
+    }
+    else if (IoControlCode == tabletdisplay::ipc::kGetFrameEventIoctl)
+    {
+        void* Output = nullptr;
+        if (OutputBufferLength < sizeof(tabletdisplay::ipc::FrameEventResponse))
+        {
+            Status = STATUS_BUFFER_TOO_SMALL;
+        }
+        else
+        {
+            Status = WdfRequestRetrieveOutputBuffer(
+                Request,
+                sizeof(tabletdisplay::ipc::FrameEventResponse),
+                &Output,
+                nullptr);
+            if (NT_SUCCESS(Status))
+            {
+                auto* DeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
+                if (DeviceContext == nullptr || DeviceContext->pContext == nullptr)
+                {
+                    Status = STATUS_DEVICE_NOT_READY;
+                }
+                else
+                {
+                    Status = DeviceContext->pContext->CopyFrameEvent(
+                        WdfRequestGetFileObject(Request),
+                        Output,
+                        OutputBufferLength,
+                        &BytesWritten);
                 }
             }
         }

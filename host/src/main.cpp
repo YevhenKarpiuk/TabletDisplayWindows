@@ -159,6 +159,10 @@ namespace
     // request of a process without a visible window unless it opts out of that throttling.
     void UseHighResolutionTimer() noexcept
     {
+        // Each reconnect asks again; timeBeginPeriod requests would otherwise pile up.
+        static bool enabled{};
+        if (enabled) return;
+        enabled = true;
         PROCESS_POWER_THROTTLING_STATE throttling{};
         throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
         throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
@@ -1475,9 +1479,15 @@ namespace
         // last change let the encoder refine that picture and push it out of a decoder that holds
         // frames; after that nothing is encoded until the picture changes again.
         constexpr unsigned kRefinementFrames = 3;
-        // The driver has no frame event, so it is polled; a new frame waits at most this long
-        // instead of up to a whole 60 Hz tick.
+        // The driver signals an event for every new frame. Without it (older driver) frames are
+        // polled; a new frame then waits at most this long instead of up to a whole 60 Hz tick.
         constexpr auto kCapturePollInterval = std::chrono::milliseconds(1);
+        // Longest wait for the frame event, which bounds how late a keyframe request, the
+        // orientation check and the driver's shared-transport heartbeat run while nothing changes.
+        constexpr auto kMaximumFrameWait = std::chrono::milliseconds(20);
+        const HANDLE frameEvent = capture.FrameEvent();
+        if (frameEvent == nullptr) UseHighResolutionTimer();
+        std::cout << "Frame delivery: " << (frameEvent != nullptr ? "driver event" : "1 ms polling") << '\n';
 
         struct PreparedFrameSlot
         {
@@ -1580,7 +1590,21 @@ namespace
                         // A keyframe request is answered even while the picture is static.
                         if (forceKeyFrame.load()) break;
                         if (refinementsLeft > 0 && now - lastSubmitted >= frameDuration) break;
-                        std::this_thread::sleep_for(kCapturePollInterval);
+                        if (frameEvent != nullptr)
+                        {
+                            auto wait = kMaximumFrameWait;
+                            if (refinementsLeft > 0)
+                            {
+                                const auto untilRefinement = std::chrono::ceil<std::chrono::milliseconds>(
+                                    lastSubmitted + frameDuration - now);
+                                wait = std::clamp(untilRefinement, std::chrono::milliseconds(0), wait);
+                            }
+                            (void)WaitForSingleObject(frameEvent, static_cast<DWORD>(wait.count()));
+                        }
+                        else
+                        {
+                            std::this_thread::sleep_for(kCapturePollInterval);
+                        }
                     }
                     if (newFrame)
                         refinementsLeft = kRefinementFrames;
@@ -1954,7 +1978,6 @@ int main(int argc, char* argv[])
 {
     try
     {
-        UseHighResolutionTimer();
         const std::string_view command = argc > 1 ? argv[1] : "--check";
         if (command == "--help")
         {

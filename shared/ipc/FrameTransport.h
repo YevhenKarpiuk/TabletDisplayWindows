@@ -121,6 +121,15 @@ namespace tabletdisplay::ipc
         return static_cast<std::uint16_t>(kEdidBaseProductCode + slot);
     }
 
+    // Output of kGetFrameEventIoctl: the name of an auto-reset event that the driver signals
+    // after every new frame of the caller's leased monitor, so the Host waits instead of polling.
+    struct FrameEventResponse
+    {
+        std::uint32_t structureBytes{ sizeof(FrameEventResponse) };
+        std::uint32_t nameLength{};
+        wchar_t name[kSharedResourceNameChars]{};
+    };
+
     inline constexpr ULONG kGetLatestFrameIoctl = CTL_CODE(
         FILE_DEVICE_UNKNOWN,
         0x800,
@@ -141,6 +150,11 @@ namespace tabletdisplay::ipc
         0x803,
         METHOD_BUFFERED,
         FILE_READ_ACCESS);
+    inline constexpr ULONG kGetFrameEventIoctl = CTL_CODE(
+        FILE_DEVICE_UNKNOWN,
+        0x804,
+        METHOD_BUFFERED,
+        FILE_READ_ACCESS);
 
     static_assert(sizeof(FrameRequest) == 16);
     static_assert(sizeof(FrameResponseHeader) == 64);
@@ -149,4 +163,5 @@ namespace tabletdisplay::ipc
     static_assert(sizeof(FrameTransportRequest) == 16);
     static_assert(sizeof(MonitorConnectionRequest) == 16);
     static_assert(sizeof(MonitorConnectionResponse) == 8);
+    static_assert(sizeof(FrameEventResponse) == 8 + kSharedResourceNameChars * sizeof(wchar_t));
 }
