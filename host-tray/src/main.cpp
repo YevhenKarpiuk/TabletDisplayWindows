@@ -3,41 +3,82 @@
 #include <windows.h>
 #include <dbt.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
 
 #include "../resource.h"
+#include "display/DisplayModes.h"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
 {
     constexpr UINT kTrayMessage = WM_APP + 1;
-    constexpr UINT_PTR kProcessTimer = 1;
+    constexpr UINT kDevicesMessage = WM_APP + 2;
     constexpr UINT kExitCommand = 1001;
     constexpr UINT kAutoStartCommand = 1002;
-    // kResolutionCommandBase + N selects the tablet resolution divided by N (1..4).
+    // kResolutionCommandBase + 10 * monitor index + N selects that tablet's resolution
+    // divided by N (1..4).
     constexpr UINT kResolutionCommandBase = 1100;
+    constexpr UINT kResolutionCommandStride = 10;
     constexpr DWORD kMaxResolutionDivisor = 4;
+    // One TabletDisplay monitor, Host process and adb forward port per connected tablet;
+    // the driver offers up to four monitors.
+    constexpr DWORD kMaxMonitors = 4;
+    constexpr DWORD kBasePort = 27183;
+    constexpr DWORD kDevicePollMs = 2'000;
+    constexpr ULONGLONG kAdbTimeoutMs = 10'000;
     constexpr wchar_t kWindowClass[] = L"TabletDisplayTrayWindow";
     constexpr wchar_t kMutexName[] = L"Local\\TabletDisplayTray-48B668E5-4AE8-4A35-A64F-328827B7ABDA";
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValueName[] = L"TabletDisplay";
     constexpr wchar_t kSettingsKey[] = L"Software\\TabletDisplay";
     constexpr wchar_t kResolutionDivisorValueName[] = L"ResolutionDivisor";
+    constexpr wchar_t kMonitorsKey[] = L"Software\\TabletDisplay\\Monitors";
+    // Per tablet: its resolution divisor, and the panel size and orientation its Host last saw.
+    constexpr wchar_t kDevicesKey[] = L"Software\\TabletDisplay\\Devices\\";
     constexpr GUID kSessionDisplayStatus{
         0x2b84c20e, 0xad23, 0x4ddf, { 0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5 }
     };
 
+    struct AdbDevice
+    {
+        std::wstring serial;
+        std::wstring model;
+        bool ready{};
+    };
+
+    // The Host streaming one TabletDisplay monitor; serial is empty while the monitor is free.
+    struct HostSlot
+    {
+        std::wstring serial;
+        PROCESS_INFORMATION process{};
+        HANDLE stopEvent{};
+        std::wstring stopEventName;
+    };
+
     NOTIFYICONDATAW g_trayIcon{};
-    PROCESS_INFORMATION g_hostProcess{};
-    HANDLE g_hostStopEvent{};
-    std::wstring g_hostStopEventName;
+    HostSlot g_hosts[kMaxMonitors];
+    std::mutex g_devicesMutex;
+    std::vector<AdbDevice> g_devices;
+    std::jthread g_deviceWatcher;
+    bool g_reportedMissingHost{};
     HANDLE g_instanceMutex{};
     HPOWERNOTIFY g_displayPowerNotification{};
     bool g_exiting{};
     bool g_displayPoweredOn{ true };
+    bool g_sessionLocked{};
     UINT g_taskbarCreated{};
 
     std::filesystem::path ExecutablePath()
@@ -148,6 +189,42 @@ namespace
             sizeof(divisor)) == ERROR_SUCCESS;
     }
 
+    DWORD DeviceValue(const std::wstring& serial, const wchar_t* name, DWORD fallback) noexcept
+    {
+        DWORD value{};
+        DWORD valueBytes = sizeof(value);
+        const auto key = kDevicesKey + serial;
+        const auto result = RegGetValueW(
+            HKEY_CURRENT_USER, key.c_str(), name, RRF_RT_REG_DWORD, nullptr, &value, &valueBytes);
+        return result == ERROR_SUCCESS ? value : fallback;
+    }
+
+    // Tablets without their own choice start with the resolution chosen before per-tablet settings.
+    DWORD DeviceResolutionDivisor(const std::wstring& serial) noexcept
+    {
+        const auto value = DeviceValue(serial, kResolutionDivisorValueName, ResolutionDivisor());
+        return value >= 1 && value <= kMaxResolutionDivisor ? value : 1;
+    }
+
+    bool SetDeviceResolutionDivisor(const std::wstring& serial, DWORD divisor) noexcept
+    {
+        const auto key = kDevicesKey + serial;
+        return RegSetKeyValueW(
+            HKEY_CURRENT_USER, key.c_str(), kResolutionDivisorValueName, REG_DWORD,
+            &divisor, sizeof(divisor)) == ERROR_SUCCESS;
+    }
+
+    // The Windows monitor size for the divisor in the tablet's current orientation, or nothing
+    // until the tablet's Host has connected once.
+    std::optional<tabletdisplay::display::Mode> DeviceMode(const std::wstring& serial, DWORD divisor) noexcept
+    {
+        const auto mode = tabletdisplay::display::ScaledMode(
+            DeviceValue(serial, L"NativeWidth", 0), DeviceValue(serial, L"NativeHeight", 0), divisor);
+        if (!tabletdisplay::display::IsSupportedMode(mode)) return std::nullopt;
+        if (DeviceValue(serial, L"Portrait", 0) != 0) return tabletdisplay::display::Mode{ mode.height, mode.width };
+        return mode;
+    }
+
     void ReleaseTabletMouseButton() noexcept
     {
         INPUT input{};
@@ -168,39 +245,264 @@ namespace
             0);
     }
 
-    void CloseHostHandles() noexcept
+    std::wstring EnvironmentValue(const wchar_t* name)
     {
-        if (g_hostProcess.hThread)
-        {
-            CloseHandle(g_hostProcess.hThread);
-            g_hostProcess.hThread = nullptr;
-        }
-        if (g_hostProcess.hProcess)
-        {
-            CloseHandle(g_hostProcess.hProcess);
-            g_hostProcess.hProcess = nullptr;
-        }
-        g_hostProcess.dwProcessId = 0;
-        g_hostProcess.dwThreadId = 0;
+        const auto size = GetEnvironmentVariableW(name, nullptr, 0);
+        if (size == 0) return {};
+        std::wstring value(size, L'\0');
+        value.resize(GetEnvironmentVariableW(name, value.data(), size));
+        return value;
     }
 
-    void StopHost() noexcept
+    // The same search order as TabletDisplayHost, starting with the bundled platform-tools.
+    std::filesystem::path FindAdb()
     {
-        bool terminatedRunningHost{};
-        if (g_hostProcess.hProcess)
+        std::vector<std::filesystem::path> candidates;
+        candidates.push_back(ExecutableDirectory() / L"platform-tools" / L"adb.exe");
+        const auto explicitPath = EnvironmentValue(L"TABLETDISPLAY_ADB");
+        if (!explicitPath.empty()) candidates.emplace_back(explicitPath);
+        const auto androidHome = EnvironmentValue(L"ANDROID_HOME");
+        if (!androidHome.empty())
+            candidates.push_back(std::filesystem::path(androidHome) / L"platform-tools" / L"adb.exe");
+        candidates.emplace_back(L"C:\\tools\\android\\sdk\\platform-tools\\adb.exe");
+        wchar_t found[MAX_PATH]{};
+        if (SearchPathW(nullptr, L"adb.exe", nullptr, MAX_PATH, found, nullptr) != 0)
+            candidates.emplace_back(found);
+        for (const auto& candidate : candidates)
         {
-            if (WaitForSingleObject(g_hostProcess.hProcess, 0) == WAIT_TIMEOUT)
+            std::error_code error;
+            if (std::filesystem::is_regular_file(candidate, error)) return candidate;
+        }
+        return {};
+    }
+
+    // Runs "adb devices" and returns its output, or nothing when adb fails or hangs.
+    std::optional<std::string> AdbDevicesOutput(const std::filesystem::path& adb)
+    {
+        SECURITY_ATTRIBUTES security{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+        HANDLE readPipe{};
+        HANDLE writePipe{};
+        if (!CreatePipe(&readPipe, &writePipe, &security, 0)) return std::nullopt;
+        if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0))
+        {
+            CloseHandle(readPipe);
+            CloseHandle(writePipe);
+            return std::nullopt;
+        }
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdOutput = writePipe;
+        startup.hStdError = writePipe;
+        PROCESS_INFORMATION process{};
+        auto command = L"\"" + adb.wstring() + L"\" devices -l";
+        const auto created = CreateProcessW(
+            adb.c_str(), command.data(), nullptr, nullptr, TRUE,
+            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+        CloseHandle(writePipe);
+        if (!created)
+        {
+            CloseHandle(readPipe);
+            return std::nullopt;
+        }
+
+        // The adb server started by the first command inherits the pipe and keeps it open,
+        // so the output is read only while the adb client process itself is running.
+        std::string output;
+        char buffer[4096];
+        const auto drain = [&]
+        {
+            DWORD available{};
+            while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available != 0)
             {
-                // A graceful stop lets the Host end the stream and detach the monitor itself.
-                if (g_hostStopEvent) (void)SetEvent(g_hostStopEvent);
-                if (WaitForSingleObject(g_hostProcess.hProcess, 4'000) == WAIT_TIMEOUT)
+                DWORD count{};
+                if (!ReadFile(readPipe, buffer, std::min<DWORD>(available, sizeof(buffer)), &count, nullptr) ||
+                    count == 0)
+                    return;
+                output.append(buffer, count);
+            }
+        };
+        const auto deadline = GetTickCount64() + kAdbTimeoutMs;
+        bool finished{};
+        while (!finished)
+        {
+            finished = WaitForSingleObject(process.hProcess, 50) == WAIT_OBJECT_0;
+            drain();
+            if (!finished && GetTickCount64() >= deadline) break;
+        }
+        if (!finished)
+        {
+            (void)TerminateProcess(process.hProcess, 1);
+            (void)WaitForSingleObject(process.hProcess, 1'000);
+        }
+        DWORD exitCode{ 1 };
+        (void)GetExitCodeProcess(process.hProcess, &exitCode);
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        CloseHandle(readPipe);
+        if (!finished || exitCode != 0) return std::nullopt;
+        return output;
+    }
+
+    std::vector<AdbDevice> ParseAdbDevices(const std::string& output)
+    {
+        std::vector<AdbDevice> devices;
+        std::istringstream lines(output);
+        std::string line;
+        while (std::getline(lines, line))
+        {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line.starts_with("List of devices") || line.front() == '*') continue;
+            std::istringstream fields(line);
+            std::string serial;
+            std::string state;
+            fields >> serial >> state;
+            if (serial.empty() || state.empty()) continue;
+            std::string model;
+            for (std::string field; fields >> field;)
+            {
+                if (field.starts_with("model:")) model = field.substr(6);
+            }
+            std::replace(model.begin(), model.end(), '_', ' ');
+            devices.push_back({
+                std::wstring(serial.begin(), serial.end()),
+                std::wstring(model.begin(), model.end()),
+                state == "device" });
+        }
+        return devices;
+    }
+
+    // Polls adb on a worker thread, because adb can block for seconds, and posts the device
+    // list to the tray window.
+    void WatchDevices(std::stop_token stopToken, HWND window)
+    {
+        std::mutex mutex;
+        std::condition_variable_any wake;
+        std::unique_lock lock(mutex);
+        do
+        {
+            const auto adb = FindAdb();
+            const auto output = adb.empty() ? std::nullopt : AdbDevicesOutput(adb);
+            if (output)
+            {
+                {
+                    std::lock_guard devicesLock(g_devicesMutex);
+                    g_devices = ParseAdbDevices(*output);
+                }
+                (void)PostMessageW(window, kDevicesMessage, 0, 0);
+            }
+        } while (!wake.wait_for(lock, stopToken, std::chrono::milliseconds(kDevicePollMs), [] { return false; }));
+    }
+
+    // Each tablet keeps the monitor it got first, so Windows restores its display position.
+    DWORD SavedMonitor(const std::wstring& serial) noexcept
+    {
+        DWORD value{};
+        DWORD valueBytes = sizeof(value);
+        const auto result = RegGetValueW(
+            HKEY_CURRENT_USER, kMonitorsKey, serial.c_str(), RRF_RT_REG_DWORD, nullptr, &value, &valueBytes);
+        return result == ERROR_SUCCESS && value >= 1 && value <= kMaxMonitors ? value : 0;
+    }
+
+    void SaveMonitor(const std::wstring& serial, DWORD monitor) noexcept
+    {
+        (void)RegSetKeyValueW(
+            HKEY_CURRENT_USER, kMonitorsKey, serial.c_str(), REG_DWORD, &monitor, sizeof(monitor));
+    }
+
+    bool MonitorSavedForOtherTablet(DWORD monitor, const std::wstring& serial)
+    {
+        HKEY key{};
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kMonitorsKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+            return false;
+        bool saved{};
+        for (DWORD index = 0; !saved; ++index)
+        {
+            wchar_t name[256]{};
+            DWORD nameChars = ARRAYSIZE(name);
+            DWORD type{};
+            DWORD value{};
+            DWORD valueBytes = sizeof(value);
+            const auto result = RegEnumValueW(
+                key, index, name, &nameChars, nullptr, &type, reinterpret_cast<BYTE*>(&value), &valueBytes);
+            if (result == ERROR_NO_MORE_ITEMS) break;
+            if (result != ERROR_SUCCESS) continue;
+            saved = type == REG_DWORD && value == monitor && serial != name;
+        }
+        RegCloseKey(key);
+        return saved;
+    }
+
+    // Returns the 1-based monitor for the tablet, or 0 when all monitors are busy.
+    DWORD AssignMonitor(const std::wstring& serial)
+    {
+        const auto isFree = [](DWORD monitor) { return g_hosts[monitor - 1].serial.empty(); };
+        const auto saved = SavedMonitor(serial);
+        if (saved != 0 && isFree(saved)) return saved;
+        DWORD fallback{};
+        for (DWORD monitor = 1; monitor <= kMaxMonitors; ++monitor)
+        {
+            if (!isFree(monitor)) continue;
+            if (!MonitorSavedForOtherTablet(monitor, serial))
+            {
+                SaveMonitor(serial, monitor);
+                return monitor;
+            }
+            if (fallback == 0) fallback = monitor;
+        }
+        if (fallback != 0) SaveMonitor(serial, fallback);
+        return fallback;
+    }
+
+    void CloseHostHandles(HostSlot& host) noexcept
+    {
+        if (host.process.hThread)
+        {
+            CloseHandle(host.process.hThread);
+            host.process.hThread = nullptr;
+        }
+        if (host.process.hProcess)
+        {
+            CloseHandle(host.process.hProcess);
+            host.process.hProcess = nullptr;
+        }
+        host.process.dwProcessId = 0;
+        host.process.dwThreadId = 0;
+    }
+
+    bool IsHostRunning(const HostSlot& host) noexcept
+    {
+        return host.process.hProcess && WaitForSingleObject(host.process.hProcess, 0) == WAIT_TIMEOUT;
+    }
+
+    // Stops the Hosts of the selected monitors together, so several tablets take one timeout.
+    void StopHosts(const std::array<bool, kMaxMonitors>& selected) noexcept
+    {
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+        {
+            // A graceful stop lets the Host end the stream and detach the monitor itself.
+            if (selected[index] && IsHostRunning(g_hosts[index]) && g_hosts[index].stopEvent)
+                (void)SetEvent(g_hosts[index].stopEvent);
+        }
+        bool terminatedRunningHost{};
+        const auto deadline = GetTickCount64() + 4'000;
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+        {
+            auto& host = g_hosts[index];
+            if (!selected[index]) continue;
+            if (host.process.hProcess)
+            {
+                const auto now = GetTickCount64();
+                const auto wait = static_cast<DWORD>(deadline > now ? deadline - now : 0);
+                if (WaitForSingleObject(host.process.hProcess, wait) == WAIT_TIMEOUT)
                 {
                     terminatedRunningHost = true;
-                    (void)TerminateProcess(g_hostProcess.hProcess, 0);
-                    (void)WaitForSingleObject(g_hostProcess.hProcess, 5'000);
+                    (void)TerminateProcess(host.process.hProcess, 0);
+                    (void)WaitForSingleObject(host.process.hProcess, 5'000);
                 }
+                CloseHostHandles(host);
             }
-            CloseHostHandles();
+            host.serial.clear();
         }
         if (terminatedRunningHost)
         {
@@ -213,21 +515,31 @@ namespace
         }
     }
 
-    bool StartHost(HWND owner)
+    void StopAllHosts() noexcept
     {
-        if (g_hostProcess.hProcess && WaitForSingleObject(g_hostProcess.hProcess, 0) == WAIT_TIMEOUT)
-            return true;
-        CloseHostHandles();
+        std::array<bool, kMaxMonitors> all{};
+        all.fill(true);
+        StopHosts(all);
+    }
+
+    bool StartHost(HWND owner, DWORD monitor, const std::wstring& serial)
+    {
+        auto& host = g_hosts[monitor - 1];
+        CloseHostHandles(host);
 
         const auto directory = ExecutableDirectory();
         const auto hostPath = directory / L"TabletDisplayHost.exe";
         if (!std::filesystem::is_regular_file(hostPath))
         {
-            MessageBoxW(
-                owner,
-                L"TabletDisplayHost.exe не знайдено.\n\nTabletDisplayHost.exe was not found.",
-                L"TabletDisplay",
-                MB_OK | MB_ICONERROR);
+            if (!g_reportedMissingHost)
+            {
+                g_reportedMissingHost = true;
+                MessageBoxW(
+                    owner,
+                    L"TabletDisplayHost.exe не знайдено.\n\nTabletDisplayHost.exe was not found.",
+                    L"TabletDisplay",
+                    MB_OK | MB_ICONERROR);
+            }
             return false;
         }
 
@@ -235,17 +547,22 @@ namespace
         if (std::filesystem::is_regular_file(bundledAdb))
             (void)SetEnvironmentVariableW(L"TABLETDISPLAY_ADB", bundledAdb.c_str());
 
-        if (!g_hostStopEvent)
+        if (!host.stopEvent)
         {
-            g_hostStopEventName = L"Local\\TabletDisplayHostStop-" + std::to_wstring(GetCurrentProcessId());
-            g_hostStopEvent = CreateEventW(nullptr, TRUE, FALSE, g_hostStopEventName.c_str());
-            if (!g_hostStopEvent) return false;
+            host.stopEventName = L"Local\\TabletDisplayHostStop-" + std::to_wstring(GetCurrentProcessId()) +
+                L"-" + std::to_wstring(monitor);
+            host.stopEvent = CreateEventW(nullptr, TRUE, FALSE, host.stopEventName.c_str());
+            if (!host.stopEvent) return false;
         }
-        (void)ResetEvent(g_hostStopEvent);
+        (void)ResetEvent(host.stopEvent);
 
+        // Every tablet gets its own Host, monitor and local adb forward port.
         std::wstring command = L"\"" + hostPath.wstring() +
-            L"\" --virtual-stream --reconnect --seconds 0 --scale " +
-            std::to_wstring(ResolutionDivisor()) + L" --stop-event " + g_hostStopEventName;
+            L"\" --virtual-stream --reconnect --seconds 0 --serial \"" + serial +
+            L"\" --monitor " + std::to_wstring(monitor) +
+            L" --port " + std::to_wstring(kBasePort + monitor - 1) +
+            L" --scale " + std::to_wstring(DeviceResolutionDivisor(serial)) +
+            L" --stop-event " + host.stopEventName;
         std::vector<wchar_t> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back(L'\0');
         STARTUPINFOW startup{};
@@ -262,13 +579,70 @@ namespace
                 nullptr,
                 directory.c_str(),
                 &startup,
-                &g_hostProcess))
+                &host.process))
         {
             return false;
         }
-        CloseHandle(g_hostProcess.hThread);
-        g_hostProcess.hThread = nullptr;
+        CloseHandle(host.process.hThread);
+        host.process.hThread = nullptr;
+        host.serial = serial;
         return true;
+    }
+
+    void UpdateTrayTip() noexcept;
+
+    // Starts a Host for every authorized tablet, restarts Hosts that exited and stops the Hosts
+    // of tablets that were unplugged.
+    void ReconcileHosts(HWND window)
+    {
+        if (g_exiting || !g_displayPoweredOn || g_sessionLocked) return;
+        std::vector<AdbDevice> devices;
+        {
+            std::lock_guard lock(g_devicesMutex);
+            devices = g_devices;
+        }
+        const auto find = [&](const std::wstring& serial)
+        {
+            return std::find_if(devices.begin(), devices.end(), [&](const AdbDevice& device)
+            {
+                return device.serial == serial;
+            });
+        };
+
+        std::array<bool, kMaxMonitors> unplugged{};
+        bool anyUnplugged{};
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+        {
+            const auto& host = g_hosts[index];
+            if (!host.serial.empty() && find(host.serial) == devices.end())
+            {
+                unplugged[index] = true;
+                anyUnplugged = true;
+            }
+        }
+        if (anyUnplugged) StopHosts(unplugged);
+
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+        {
+            auto& host = g_hosts[index];
+            if (host.serial.empty() || IsHostRunning(host)) continue;
+            // The Host exited on its own (for example its watchdog fired): restart it.
+            const auto serial = host.serial;
+            (void)StartHost(window, index + 1, serial);
+        }
+
+        for (const auto& device : devices)
+        {
+            if (!device.ready) continue;
+            const bool hasHost = std::any_of(std::begin(g_hosts), std::end(g_hosts), [&](const HostSlot& host)
+            {
+                return host.serial == device.serial;
+            });
+            if (hasHost) continue;
+            const auto monitor = AssignMonitor(device.serial);
+            if (monitor != 0) (void)StartHost(window, monitor, device.serial);
+        }
+        UpdateTrayTip();
     }
 
     void AddTrayIcon(HWND window)
@@ -288,6 +662,22 @@ namespace
         (void)Shell_NotifyIconW(NIM_SETVERSION, &g_trayIcon);
     }
 
+    void UpdateTrayTip() noexcept
+    {
+        const auto count = std::count_if(std::begin(g_hosts), std::end(g_hosts), [](const HostSlot& host)
+        {
+            return !host.serial.empty();
+        });
+        std::wstring tip = L"TabletDisplay";
+        if (count > 0)
+            tip += (IsUkrainianUi() ? L": \u043f\u043b\u0430\u043d\u0448\u0435\u0442\u0456\u0432 " : L": tablets ") +
+                std::to_wstring(count);
+        if (tip == g_trayIcon.szTip) return;
+        wcsncpy_s(g_trayIcon.szTip, tip.c_str(), _TRUNCATE);
+        g_trayIcon.uFlags = NIF_TIP | NIF_SHOWTIP;
+        (void)Shell_NotifyIconW(NIM_MODIFY, &g_trayIcon);
+    }
+
     void ShowTrayMenu(HWND window)
     {
         const auto menu = CreatePopupMenu();
@@ -298,35 +688,64 @@ namespace
         const auto autoStartFlags = MF_STRING |
             (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
 
-        const auto resolutionMenu = CreatePopupMenu();
-        if (resolutionMenu)
+        const wchar_t* const ukrainianLabels[] = {
+            L"\u041e\u0440\u0438\u0433\u0456\u043d\u0430\u043b\u044c\u043d\u0430",
+            L"\u0423 2 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
+            L"\u0423 3 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
+            L"\u0423 4 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
+        };
+        const wchar_t* const englishLabels[] = {
+            L"Native", L"2 times smaller", L"3 times smaller", L"4 times smaller",
+        };
+        std::vector<AdbDevice> devices;
         {
-            const wchar_t* const ukrainianLabels[] = {
-                L"\u041e\u0440\u0438\u0433\u0456\u043d\u0430\u043b\u044c\u043d\u0430",
-                L"\u0423 2 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
-                L"\u0423 3 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
-                L"\u0423 4 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
-            };
-            const wchar_t* const englishLabels[] = {
-                L"Native", L"2 times smaller", L"3 times smaller", L"4 times smaller",
-            };
-            const auto selected = ResolutionDivisor();
+            std::lock_guard lock(g_devicesMutex);
+            devices = g_devices;
+        }
+        // Every connected tablet has its own resolution submenu, named after its monitor.
+        bool listedTablet{};
+        for (DWORD index = 0; index < kMaxMonitors; ++index)
+        {
+            const auto& serial = g_hosts[index].serial;
+            if (serial.empty()) continue;
+            const auto resolutionMenu = CreatePopupMenu();
+            if (!resolutionMenu) continue;
+            const auto selected = DeviceResolutionDivisor(serial);
             for (DWORD divisor = 1; divisor <= kMaxResolutionDivisor; ++divisor)
             {
+                std::wstring label = (ukrainian ? ukrainianLabels : englishLabels)[divisor - 1];
+                const auto mode = DeviceMode(serial, divisor);
+                if (mode)
+                    label += L" (" + std::to_wstring(mode->width) + L"\u00D7" + std::to_wstring(mode->height) + L")";
                 (void)AppendMenuW(
                     resolutionMenu,
                     MF_STRING | (divisor == selected ? MF_CHECKED : MF_UNCHECKED),
-                    kResolutionCommandBase + divisor,
-                    (ukrainian ? ukrainianLabels : englishLabels)[divisor - 1]);
+                    kResolutionCommandBase + index * kResolutionCommandStride + divisor,
+                    label.c_str());
             }
+            const auto device = std::find_if(devices.begin(), devices.end(), [&](const AdbDevice& candidate)
+            {
+                return candidate.serial == serial;
+            });
+            const auto name = device != devices.end() && !device->model.empty()
+                ? device->model + L" (" + serial + L")"
+                : serial;
+            const auto title = (ukrainian ? L"\u041c\u043e\u043d\u0456\u0442\u043e\u0440 " : L"Monitor ") +
+                std::to_wstring(index + 1) + L": " + name;
+            (void)AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(resolutionMenu), title.c_str());
+            listedTablet = true;
+        }
+        if (!listedTablet)
+        {
             (void)AppendMenuW(
                 menu,
-                MF_POPUP,
-                reinterpret_cast<UINT_PTR>(resolutionMenu),
+                MF_STRING | MF_GRAYED,
+                0,
                 ukrainian
-                    ? L"\u0420\u043e\u0437\u0434\u0456\u043b\u044c\u043d\u0430 \u0437\u0434\u0430\u0442\u043d\u0456\u0441\u0442\u044c"
-                    : L"Resolution");
+                    ? L"\u041f\u043b\u0430\u043d\u0448\u0435\u0442\u0438 \u043d\u0435 \u043f\u0456\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0456"
+                    : L"No tablets connected");
         }
+        (void)AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         (void)AppendMenuW(menu, autoStartFlags, kAutoStartCommand, autoStartText);
         (void)AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         (void)AppendMenuW(menu, MF_STRING, kExitCommand, exitText);
@@ -353,20 +772,25 @@ namespace
                 window,
                 &kSessionDisplayStatus,
                 DEVICE_NOTIFY_WINDOW_HANDLE);
+            // A locked session releases the tablets like turned-off displays, so they may sleep.
+            (void)WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION);
             AddTrayIcon(window);
-            (void)SetTimer(window, kProcessTimer, 2'000, nullptr);
-            (void)StartHost(window);
+            g_deviceWatcher = std::jthread(WatchDevices, window);
             return 0;
-        case WM_TIMER:
-            if (wParam == kProcessTimer && !g_exiting && g_displayPoweredOn)
+        case WM_WTSSESSION_CHANGE:
+            if (wParam == WTS_SESSION_LOCK && !g_sessionLocked)
             {
-                if (!g_hostProcess.hProcess ||
-                    WaitForSingleObject(g_hostProcess.hProcess, 0) == WAIT_OBJECT_0)
-                {
-                    CloseHostHandles();
-                    (void)StartHost(window);
-                }
+                g_sessionLocked = true;
+                StopAllHosts();
             }
+            else if (wParam == WTS_SESSION_UNLOCK && g_sessionLocked)
+            {
+                g_sessionLocked = false;
+                ReconcileHosts(window);
+            }
+            return 0;
+        case kDevicesMessage:
+            ReconcileHosts(window);
             return 0;
         case WM_POWERBROADCAST:
             if (wParam == PBT_POWERSETTINGCHANGE && lParam != 0)
@@ -382,9 +806,9 @@ namespace
                     {
                         g_displayPoweredOn = poweredOn;
                         if (poweredOn)
-                            (void)StartHost(window);
+                            ReconcileHosts(window);
                         else
-                            StopHost();
+                            StopAllHosts();
                     }
                 }
                 return TRUE;
@@ -414,14 +838,20 @@ namespace
                 return 0;
             }
             if (LOWORD(wParam) > kResolutionCommandBase &&
-                LOWORD(wParam) <= kResolutionCommandBase + kMaxResolutionDivisor)
+                LOWORD(wParam) < kResolutionCommandBase + kMaxMonitors * kResolutionCommandStride)
             {
-                const DWORD divisor = LOWORD(wParam) - kResolutionCommandBase;
-                if (divisor != ResolutionDivisor() && SetResolutionDivisor(divisor))
+                const DWORD index = (LOWORD(wParam) - kResolutionCommandBase) / kResolutionCommandStride;
+                const DWORD divisor = (LOWORD(wParam) - kResolutionCommandBase) % kResolutionCommandStride;
+                const auto serial = g_hosts[index].serial;
+                if (divisor >= 1 && divisor <= kMaxResolutionDivisor && !serial.empty() &&
+                    divisor != DeviceResolutionDivisor(serial) &&
+                    SetDeviceResolutionDivisor(serial, divisor))
                 {
-                    // The Host chooses the monitor mode when it connects, so restart it.
-                    StopHost();
-                    if (g_displayPoweredOn) (void)StartHost(window);
+                    // The Host chooses the monitor mode when it connects, so restart only its Host.
+                    std::array<bool, kMaxMonitors> selected{};
+                    selected[index] = true;
+                    StopHosts(selected);
+                    ReconcileHosts(window);
                 }
                 return 0;
             }
@@ -438,7 +868,8 @@ namespace
             return 0;
         case WM_DESTROY:
             g_exiting = true;
-            (void)KillTimer(window, kProcessTimer);
+            g_deviceWatcher.request_stop();
+            (void)WTSUnRegisterSessionNotification(window);
             if (g_displayPowerNotification)
             {
                 (void)UnregisterPowerSettingNotification(g_displayPowerNotification);
@@ -446,7 +877,8 @@ namespace
             }
             (void)Shell_NotifyIconW(NIM_DELETE, &g_trayIcon);
             if (g_trayIcon.hIcon) DestroyIcon(g_trayIcon.hIcon);
-            StopHost();
+            StopAllHosts();
+            if (g_deviceWatcher.joinable()) g_deviceWatcher.join();
             PostQuitMessage(0);
             return 0;
         }
@@ -484,7 +916,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    if (g_hostStopEvent) CloseHandle(g_hostStopEvent);
+    for (auto& host : g_hosts)
+    {
+        if (host.stopEvent) CloseHandle(host.stopEvent);
+    }
     CloseHandle(g_instanceMutex);
     return static_cast<int>(message.wParam);
 }

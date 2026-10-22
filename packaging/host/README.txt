@@ -17,6 +17,7 @@ EN
 - Enable “Start with Windows” in the tray menu to launch the Host after signing in to Windows.
 - When Windows turns the displays off to save power, the tablet turns black; streaming resumes automatically after wake-up.
 - The virtual monitor appears in Windows only after the Host connects to the tablet app and disappears when that connection is lost.
+- Up to four tablets can be connected at once. Each gets its own virtual monitor (Monitor 1..4 in the tray menu) and keeps it on reconnect; touches from different tablets share one Windows mouse cursor.
 - For portrait mode, set TabletDisplay to “Display orientation: Portrait” in Windows Settings and rotate the tablet.
 - Click the tray icon and choose “Exit” to quit.
 

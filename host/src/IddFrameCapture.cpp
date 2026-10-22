@@ -4,6 +4,7 @@
 #include <setupapi.h>
 
 #include "IddFrameCapture.h"
+#include "TabletMonitors.h"
 #include "ipc/FrameTransport.h"
 
 #include <algorithm>
@@ -159,31 +160,39 @@ namespace tabletdisplay::host
         }
 
         [[nodiscard]] bool FindAttachedTabletDisplay(
+            std::uint32_t slot,
             std::wstring* deviceName = nullptr,
             DWORD* stateFlags = nullptr) noexcept
         {
-            for (DWORD index = 0;; ++index)
+            try
             {
+                const auto name = FindTabletDisplayDevice(slot);
+                if (!name) return false;
                 DISPLAY_DEVICEW display{};
                 display.cb = sizeof(display);
-                if (!EnumDisplayDevicesW(nullptr, index, &display, 0))
-                    return false;
-                if (wcscmp(display.DeviceString, L"TabletDisplay Virtual Display") != 0 ||
-                    (display.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) == 0)
+                for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &display, 0); ++index)
                 {
-                    continue;
+                    if (*name == display.DeviceName)
+                    {
+                        if (deviceName != nullptr) *deviceName = display.DeviceName;
+                        if (stateFlags != nullptr) *stateFlags = display.StateFlags;
+                        return true;
+                    }
+                    display = {};
+                    display.cb = sizeof(display);
                 }
-                if (deviceName != nullptr) *deviceName = display.DeviceName;
-                if (stateFlags != nullptr) *stateFlags = display.StateFlags;
-                return true;
             }
+            catch (...)
+            {
+            }
+            return false;
         }
 
-        void PrepareTabletDisplayForDeparture() noexcept
+        void PrepareTabletDisplayForDeparture(std::uint32_t slot) noexcept
         {
             std::wstring deviceName;
             DWORD stateFlags{};
-            if (!FindAttachedTabletDisplay(&deviceName, &stateFlags) ||
+            if (!FindAttachedTabletDisplay(slot, &deviceName, &stateFlags) ||
                 (stateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0)
             {
                 return;
@@ -209,7 +218,7 @@ namespace tabletdisplay::host
 
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::seconds(2);
-            while (FindAttachedTabletDisplay() &&
+            while (FindAttachedTabletDisplay(slot) &&
                    std::chrono::steady_clock::now() < deadline)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -271,7 +280,7 @@ namespace tabletdisplay::host
         {
             const auto wasConnected = monitorConnected;
             if (!connected && wasConnected)
-                PrepareTabletDisplayForDeparture();
+                PrepareTabletDisplayForDeparture(slot);
 
             tabletdisplay::ipc::MonitorConnectionRequest request{};
             request.connected = connected ? 1U : 0U;
@@ -280,6 +289,7 @@ namespace tabletdisplay::host
                 request.nativeWidth = modes.nativeWidth;
                 request.nativeHeight = modes.nativeHeight;
                 request.preferredDivisor = modes.preferredDivisor;
+                request.slot = modes.slot;
                 // Frames never exceed the tablet resolution, so the CPU fallback buffer can too.
                 const auto frameBytes = modes.nativeWidth != 0 && modes.nativeHeight != 0
                     ? static_cast<std::size_t>(modes.nativeWidth) * modes.nativeHeight *
@@ -292,20 +302,42 @@ namespace tabletdisplay::host
             DWORD error{};
             for (;;)
             {
+                tabletdisplay::ipc::MonitorConnectionResponse connectionResponse{};
                 DWORD returnedBytes{};
                 if (DeviceIoControl(
                         device.get(),
                         tabletdisplay::ipc::kSetMonitorConnectionIoctl,
                         &request,
                         static_cast<DWORD>(sizeof(request)),
-                        nullptr,
-                        0,
+                        &connectionResponse,
+                        static_cast<DWORD>(sizeof(connectionResponse)),
                         &returnedBytes,
                         nullptr))
                 {
+                    // A driver with a single monitor returns no slot.
+                    if (connected)
+                    {
+                        slot = returnedBytes == sizeof(connectionResponse) &&
+                                connectionResponse.slot < tabletdisplay::ipc::kMaxMonitors
+                            ? connectionResponse.slot
+                            : 0;
+                    }
                     break;
                 }
                 error = GetLastError();
+                // A driver with a single monitor rejects the slot field; monitor 1 is its only one.
+                if (connected && error == ERROR_INVALID_PARAMETER && request.slot == 1)
+                {
+                    request.slot = 0;
+                    continue;
+                }
+                if (connected && error == ERROR_BUSY)
+                {
+                    throw std::runtime_error(request.slot == 0
+                        ? "All TabletDisplay monitors are used by other tablets"
+                        : "TabletDisplay monitor " + std::to_string(request.slot) +
+                            " is used by another tablet");
+                }
                 if (!connected ||
                     (error != ERROR_NOT_READY && error != ERROR_RETRY) ||
                     std::chrono::steady_clock::now() >= deadline)
@@ -530,6 +562,7 @@ namespace tabletdisplay::host
         std::uint64_t lastSequence{};
         std::uint64_t lastSharedSequence{};
         std::uint64_t lastSharedGeneration{};
+        std::uint32_t slot{};
         bool sharedTransport{};
         bool monitorConnected{};
     };
@@ -565,5 +598,10 @@ namespace tabletdisplay::host
     bool IddFrameCapture::UsesSharedTransport() const noexcept
     {
         return m_impl->sharedTransport;
+    }
+
+    std::uint32_t IddFrameCapture::MonitorSlot() const noexcept
+    {
+        return m_impl->slot;
     }
 }

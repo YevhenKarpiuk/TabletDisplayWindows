@@ -157,7 +157,7 @@ namespace Microsoft
             virtual ~IndirectDeviceContext();
 
             void InitAdapter();
-            void FinishInit(UINT ConnectorIndex);
+            void FinishInit();
             NTSTATUS CopyLatestFrame(
                 WDFFILEOBJECT fileObject,
                 UINT64 afterSequence,
@@ -177,22 +177,30 @@ namespace Microsoft
                 bool connected,
                 UINT nativeWidth,
                 UINT nativeHeight,
-                UINT preferredDivisor);
+                UINT preferredDivisor,
+                UINT requestedSlot,
+                UINT* leasedSlot);
             void ReleaseMonitorConnection(WDFFILEOBJECT fileObject) noexcept;
 
         protected:
-            NTSTATUS CreateMonitorLocked();
-            bool IsMonitorLeaseOwner(WDFFILEOBJECT fileObject);
+            // One virtual monitor per tablet; the Host file object that leased it owns its frames.
+            struct MonitorSlot
+            {
+                IDDCX_MONITOR Monitor{};
+                std::shared_ptr<FrameStore> Frames;
+                WDFFILEOBJECT LeaseFile{};
+                bool Connected{};
+            };
+
+            NTSTATUS CreateMonitorLocked(UINT slot);
+            std::shared_ptr<FrameStore> LeasedFrames(WDFFILEOBJECT fileObject);
+            MonitorSlot* LeasedSlotLocked(WDFFILEOBJECT fileObject);
 
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;
-            IDDCX_MONITOR m_Monitor;
-            std::shared_ptr<FrameStore> m_Frames;
             std::mutex m_MonitorMutex;
-            WDFFILEOBJECT m_MonitorLeaseFile;
-            bool m_MonitorConnected;
+            MonitorSlot m_Slots[tabletdisplay::ipc::kMaxMonitors];
             bool m_AdapterReady;
-            UINT m_ConnectorIndex;
         };
 
         class IndirectMonitorContext
@@ -200,14 +208,17 @@ namespace Microsoft
         public:
             IndirectMonitorContext(
                 _In_ IDDCX_MONITOR Monitor,
+                UINT Slot,
                 std::shared_ptr<FrameStore> Frames);
             virtual ~IndirectMonitorContext();
 
             void AssignSwapChain(IDDCX_SWAPCHAIN SwapChain, LUID RenderAdapter, HANDLE NewFrameEvent);
             void UnassignSwapChain();
+            UINT Slot() const noexcept { return m_Slot; }
 
         private:
             IDDCX_MONITOR m_Monitor;
+            UINT m_Slot;
             std::shared_ptr<FrameStore> m_Frames;
             std::unique_ptr<SwapChainProcessor> m_ProcessingThread;
         } ;

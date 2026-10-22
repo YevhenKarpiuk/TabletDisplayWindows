@@ -9,6 +9,8 @@
 #include "display/DisplayModes.h"
 #include "IddFrameCapture.h"
 #include "MediaFoundationH264Encoder.h"
+#include "TabletMonitors.h"
+#include "ipc/FrameTransport.h"
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
 #include "video/VideoProcessing.h"
@@ -45,7 +47,6 @@ namespace
     constexpr std::uint64_t kAvcProfiles = 0x0E;
     constexpr std::uint16_t kHeartbeatIntervalMs = 1'000;
     constexpr std::uint16_t kIdleTimeoutMs = 5'000;
-    constexpr std::wstring_view kTabletDisplayDeviceString = L"TabletDisplay Virtual Display";
 
     // ERROR codes and severities from doc/PROTOCOL.md section 5.9.
     constexpr std::uint16_t kErrorMalformedHeader = 1;
@@ -116,6 +117,8 @@ namespace
     };
 
     HANDLE g_stopEvent{};
+    // The driver monitor this Host leased; every tablet streams its own virtual monitor.
+    std::uint32_t g_monitorSlot{};
     std::atomic<std::uint64_t> g_lastProgressMs{ GetTickCount64() };
 
     [[nodiscard]] bool StopRequested() noexcept
@@ -318,23 +321,13 @@ namespace
 
     [[nodiscard]] std::optional<TabletDisplayMode> FindTabletDisplayMode()
     {
-        DISPLAY_DEVICEW device{};
-        device.cb = sizeof(device);
-        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
-        {
-            if (std::wstring_view(device.DeviceString) == kTabletDisplayDeviceString &&
-                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
-            {
-                TabletDisplayMode result{ device.DeviceName, {} };
-                result.mode.dmSize = sizeof(result.mode);
-                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &result.mode, 0))
-                    throw std::runtime_error("Cannot query the TabletDisplay mode");
-                return result;
-            }
-            device = {};
-            device.cb = sizeof(device);
-        }
-        return std::nullopt;
+        auto deviceName = tabletdisplay::host::FindTabletDisplayDevice(g_monitorSlot);
+        if (!deviceName) return std::nullopt;
+        TabletDisplayMode result{ std::move(*deviceName), {} };
+        result.mode.dmSize = sizeof(result.mode);
+        if (!EnumDisplaySettingsExW(result.deviceName.c_str(), ENUM_CURRENT_SETTINGS, &result.mode, 0))
+            throw std::runtime_error("Cannot query the TabletDisplay mode");
+        return result;
     }
 
     [[nodiscard]] TabletDisplayMode RequireTabletDisplayMode()
@@ -655,11 +648,14 @@ namespace
         }
     }
 
-    [[nodiscard]] bool ForwardAlreadyExists(const std::string& output, const std::string& serial)
+    [[nodiscard]] bool ForwardAlreadyExists(
+        const std::string& output,
+        const std::string& serial,
+        std::uint16_t localPort)
     {
         std::istringstream lines(output);
         std::string line;
-        const auto expected = serial + " tcp:27183 tcp:27183";
+        const auto expected = serial + " tcp:" + std::to_string(localPort) + " tcp:" + std::to_string(kPort);
         while (std::getline(lines, line))
         {
             if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -668,11 +664,11 @@ namespace
         return false;
     }
 
-    [[nodiscard]] SocketHandle ConnectLoopback()
+    [[nodiscard]] SocketHandle ConnectLoopback(std::uint16_t localPort)
     {
         sockaddr_in endpoint{};
         endpoint.sin_family = AF_INET;
-        endpoint.sin_port = htons(kPort);
+        endpoint.sin_port = htons(localPort);
         if (inet_pton(AF_INET, kLoopbackAddress.data(), &endpoint.sin_addr) != 1)
         {
             throw std::runtime_error("Invalid loopback address");
@@ -695,7 +691,7 @@ namespace
             }
             if (WaitUnlessStopped(std::chrono::milliseconds(250))) break;
         }
-        throw std::runtime_error("Cannot connect to Android on 127.0.0.1:27183");
+        throw std::runtime_error("Cannot connect to Android on 127.0.0.1:" + std::to_string(localPort));
     }
 
     void SendAll(SOCKET socket, std::span<const std::uint8_t> bytes)
@@ -1227,6 +1223,23 @@ namespace
             std::min(mode.width, mode.height) <= decoderShort;
     }
 
+    // The tray lists every tablet's resolution choices from what its Host last saw.
+    void SaveTabletDisplay(
+        const std::string& serial,
+        std::uint32_t nativeWidth,
+        std::uint32_t nativeHeight,
+        bool portrait) noexcept
+    {
+        const auto key = L"Software\\TabletDisplay\\Devices\\" + Widen(serial);
+        const DWORD values[] = { nativeWidth, nativeHeight, portrait ? 1UL : 0UL };
+        const wchar_t* const names[] = { L"NativeWidth", L"NativeHeight", L"Portrait" };
+        for (std::size_t index = 0; index < std::size(values); ++index)
+        {
+            (void)RegSetKeyValueW(
+                HKEY_CURRENT_USER, key.c_str(), names[index], REG_DWORD, &values[index], sizeof(DWORD));
+        }
+    }
+
     // About 0.13 bit per pixel: 8 Mbit/s for 1280x800 at 60 FPS, which the tablet handles well.
     [[nodiscard]] std::uint32_t BitrateFor(std::uint32_t width, std::uint32_t height, std::uint32_t fps) noexcept
     {
@@ -1237,12 +1250,15 @@ namespace
 
     // seconds == 0 streams until the tray stops the Host or the connection fails.
     // The virtual monitor uses the tablet resolution divided by resolutionDivisor (1..4).
+    // monitor 0 leases the first free driver monitor, N (1..4) leases monitor N.
     void RunVirtualDisplayStream(
         SOCKET socket,
         ProtocolSender& sender,
         IncrementalDecoder receiveDecoder,
         const AndroidDisplay& display,
+        const std::string& serial,
         unsigned resolutionDivisor,
+        unsigned monitor,
         unsigned seconds)
     {
         namespace modes = tabletdisplay::display;
@@ -1274,10 +1290,14 @@ namespace
         capture.SetMonitorConnected(true, {
             static_cast<std::uint16_t>(native.width),
             static_cast<std::uint16_t>(native.height),
-            static_cast<std::uint16_t>(divisor) });
+            static_cast<std::uint16_t>(divisor),
+            static_cast<std::uint16_t>(monitor) });
+        g_monitorSlot = capture.MonitorSlot();
+        std::cout << "TabletDisplay monitor " << g_monitorSlot + 1 << '\n';
         ReportProgress();
         const auto orientation = WaitForTabletDisplayOrientation();
         const bool portrait = orientation == DMDO_90 || orientation == DMDO_270;
+        SaveTabletDisplay(serial, native.width, native.height, portrait);
         const auto rawWidth = static_cast<std::uint16_t>(landscape.width);
         const auto rawHeight = static_cast<std::uint16_t>(landscape.height);
         const std::uint16_t width = portrait ? rawHeight : rawWidth;
@@ -1767,17 +1787,22 @@ namespace
             << "  TabletDisplayHost --encoder-demo [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N] [--reconnect]\n"
-            << "                    [--scale 1|2|3|4] [--stop-event NAME]\n"
+            << "                    [--scale 1|2|3|4] [--monitor 1|2|3|4] [--port PORT] [--stop-event NAME]\n"
             << "  TabletDisplayHost --version\n"
             << "--seconds 0 streams the virtual display until the stop event is signaled.\n"
-            << "--scale N divides the tablet resolution by N, keeping its aspect ratio (default 1).\n";
+            << "--scale N divides the tablet resolution by N, keeping its aspect ratio (default 1).\n"
+            << "--monitor N streams TabletDisplay monitor N (default: the first free one), so several\n"
+            << "  tablets can run one Host each; every Host needs its own --serial and --port.\n"
+            << "--port PORT is the local adb forward port (default " << kPort << ").\n";
     }
 
     int ConnectCommand(
         const std::string& requestedSerial,
         RunMode mode,
         unsigned streamSeconds,
-        unsigned resolutionDivisor = 1)
+        unsigned resolutionDivisor = 1,
+        unsigned monitor = 0,
+        std::uint16_t localPort = kPort)
     {
         const auto adb = FindAdb();
         std::cout << "ADB: " << Narrow(adb.wstring()) << '\n';
@@ -1788,19 +1813,21 @@ namespace
 
         const auto forwardList = RunProcess(adb, L"forward --list");
         RequireAdbSuccess(forwardList, "adb forward --list");
-        const auto hadForward = ForwardAlreadyExists(forwardList.output, serial);
+        const auto hadForward = ForwardAlreadyExists(forwardList.output, serial, localPort);
         const auto selector = L"-s \"" + Widen(serial) + L"\" ";
+        const auto localEndpoint = L"tcp:" + std::to_wstring(localPort);
         bool createdForward{};
         try
         {
             if (!hadForward)
             {
-                const auto result = RunProcess(adb, selector + L"forward tcp:27183 tcp:27183");
+                const auto result = RunProcess(
+                    adb, selector + L"forward " + localEndpoint + L" tcp:" + std::to_wstring(kPort));
                 RequireAdbSuccess(result, "adb forward");
                 createdForward = true;
             }
             WinsockSession winsock;
-            auto socket = ConnectLoopback();
+            auto socket = ConnectLoopback(localPort);
             auto handshake = PerformHandshake(socket.get());
             ProtocolSender sender(socket.get(), handshake.nextSequence);
             try
@@ -1824,7 +1851,9 @@ namespace
                         sender,
                         std::move(handshake.decoder),
                         handshake.display,
+                        serial,
                         resolutionDivisor,
+                        monitor,
                         streamSeconds);
                 }
             }
@@ -1835,7 +1864,7 @@ namespace
             }
             if (createdForward)
             {
-                const auto result = RunProcess(adb, selector + L"forward --remove tcp:27183");
+                const auto result = RunProcess(adb, selector + L"forward --remove " + localEndpoint);
                 RequireAdbSuccess(result, "adb forward --remove");
             }
         }
@@ -1845,7 +1874,7 @@ namespace
             {
                 try
                 {
-                    (void)RunProcess(adb, selector + L"forward --remove tcp:27183");
+                    (void)RunProcess(adb, selector + L"forward --remove " + localEndpoint);
                 }
                 catch (...)
                 {
@@ -1860,7 +1889,9 @@ namespace
     int ReconnectingVirtualDisplayCommand(
         const std::string& requestedSerial,
         unsigned totalSeconds,
-        unsigned resolutionDivisor)
+        unsigned resolutionDivisor,
+        unsigned monitor,
+        std::uint16_t localPort)
     {
         using Clock = std::chrono::steady_clock;
         const bool unlimited = totalSeconds == 0;
@@ -1881,7 +1912,8 @@ namespace
             }
             try
             {
-                ConnectCommand(requestedSerial, RunMode::VirtualDisplay, attemptSeconds, resolutionDivisor);
+                ConnectCommand(
+                    requestedSerial, RunMode::VirtualDisplay, attemptSeconds, resolutionDivisor, monitor, localPort);
                 reportedMissingDevice = false;
                 if (!unlimited && !StopRequested())
                 {
@@ -1950,6 +1982,8 @@ int main(int argc, char* argv[])
             unsigned seconds = 10;
             bool reconnect = false;
             unsigned resolutionDivisor = 1;
+            unsigned monitor = 0;
+            std::uint16_t localPort = tabletdisplay::protocol::kPort;
             for (int index = 2; index < argc; ++index)
             {
                 const std::string_view option = argv[index];
@@ -1975,6 +2009,20 @@ int main(int argc, char* argv[])
                         throw std::runtime_error("--scale must be 1, 2, 3 or 4");
                     resolutionDivisor = parsed;
                 }
+                else if (option == "--monitor" && index + 1 < argc && command == "--virtual-stream")
+                {
+                    const auto parsed = std::stoul(argv[++index]);
+                    if (parsed < 1 || parsed > tabletdisplay::ipc::kMaxMonitors)
+                        throw std::runtime_error("--monitor must be 1, 2, 3 or 4");
+                    monitor = parsed;
+                }
+                else if (option == "--port" && index + 1 < argc)
+                {
+                    const auto parsed = std::stoul(argv[++index]);
+                    if (parsed < 1'024 || parsed > 65'535)
+                        throw std::runtime_error("--port must be in 1024..65535");
+                    localPort = static_cast<std::uint16_t>(parsed);
+                }
                 else if (option == "--reconnect" && command == "--virtual-stream")
                 {
                     reconnect = true;
@@ -1988,7 +2036,8 @@ int main(int argc, char* argv[])
                 else
                 {
                     throw std::runtime_error(
-                        "Expected [--serial SERIAL] [--seconds N] [--reconnect] [--scale N] [--stop-event NAME]");
+                        "Expected [--serial SERIAL] [--seconds N] [--reconnect] [--scale N] [--monitor N] "
+                        "[--port PORT] [--stop-event NAME]");
                 }
             }
             const auto mode = command == "--virtual-stream"
@@ -1998,8 +2047,9 @@ int main(int argc, char* argv[])
                     : (command == "--encoder-demo"
                         ? RunMode::EncoderDemo
                         : (command == "--demo" ? RunMode::Synthetic : RunMode::Connect)));
-            if (reconnect) return ReconnectingVirtualDisplayCommand(serial, seconds, resolutionDivisor);
-            return ConnectCommand(serial, mode, seconds, resolutionDivisor);
+            if (reconnect)
+                return ReconnectingVirtualDisplayCommand(serial, seconds, resolutionDivisor, monitor, localPort);
+            return ConnectCommand(serial, mode, seconds, resolutionDivisor, monitor, localPort);
         }
         throw std::runtime_error("Unknown argument");
     }

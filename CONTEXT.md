@@ -3,9 +3,10 @@
 Windows-часть системы, превращающей Android-планшет в дополнительный монитор Windows 11 по USB/ADB.
 
 - Парный проект: `C:\Users\ka\Documents\prog\kotlin\TabletDisplayAndroid`.
-- MVP: один виртуальный дисплей с разрешением планшета из `DISPLAY_INFO`, делённым на 1/2/3/4 (соотношение сторон планшета, чётные стороны), ландшафт или портрет, 30/60 Гц, H.264, single-touch → мышь. Делитель выбирается в меню tray (`HKCU\Software\TabletDisplay\ResolutionDivisor`, Host `--scale N`); драйвер получает разрешение планшета при подключении монитора; битрейт ≈0,13 бит/пиксель, 2–25 Мбит/с.
+- Несколько планшетов одновременно: драйвер даёт до 4 мониторов (свой EDID/product code и кадры на слот, lease на file object Host), tray запускает отдельный Host на каждый авторизованный ADB-планшет (`--serial`, `--monitor N`, `--port 27183+N-1`), слот планшета запоминается в `HKCU\Software\TabletDisplay\Monitors`. Делитель разрешения выбирается в tray отдельно для каждого планшета (`HKCU\Software\TabletDisplay\Devices\<serial>`; там же Host сохраняет разрешение панели для подписей меню). Блокировка сеанса, как и выключение дисплеев, останавливает все Host. Ввод пока общий: касания двух планшетов двигают один курсор Windows.
+- MVP: виртуальный дисплей с разрешением планшета из `DISPLAY_INFO`, делённым на 1/2/3/4 (соотношение сторон планшета, чётные стороны), ландшафт или портрет, 30/60 Гц, H.264, single-touch → мышь. Делитель выбирается в меню tray (`HKCU\Software\TabletDisplay\ResolutionDivisor`, Host `--scale N`); драйвер получает разрешение планшета при подключении монитора; битрейт ≈0,13 бит/пиксель, 2–25 Мбит/с.
 - Стек: C++20, UMDF 2/IddCx, D3D11/DXGI, Media Foundation, Winsock, MSBuild/WDK.
-- Транспорт: `adb forward tcp:27183 tcp:27183`, protocol v1 из `doc/PROTOCOL.md`.
+- Транспорт: `adb -s SERIAL forward tcp:<27183+N-1> tcp:27183`, protocol v1 из `doc/PROTOCOL.md`.
 - Инструменты: VS 2022 + WDK/Spectre; portable WDK 10.0.26100.6584, Android SDK и FFmpeg 9.0.1 в `C:\tools`.
 - Команды: `build.cmd`, `test.cmd`, `install-driver.cmd`, `check-driver.cmd`, `uninstall-driver.cmd`, `virtual-stream.cmd`, `release.cmd`.
 - Готово: test-signed IddCx `ROOT\DISPLAY\0000`; динамический monitor lease после Android-handshake; shared D3D11 texture driver→Host с keyed mutex; GPU BGRA→NV12/rotation и zero-copy NV12→Quick Sync; CPU IPC fallback; ADB TCP; protocol v1; single-touch → Windows mouse; `REQUEST_KEYFRAME` → IDR с `DISCONTINUITY`; heartbeat PING/PONG с idle timeout 5 с; fatal `ERROR` перед закрытием сессии.

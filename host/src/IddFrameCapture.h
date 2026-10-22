@@ -20,11 +20,13 @@ namespace tabletdisplay::host
     };
 
     // The tablet panel resolution and the divisor (1..4) of the preferred monitor mode.
+    // slot 0 leases the first free driver monitor; N (1..4) asks for monitor N - 1.
     struct MonitorModeRequest
     {
         std::uint16_t nativeWidth{};
         std::uint16_t nativeHeight{};
         std::uint16_t preferredDivisor{ 1 };
+        std::uint16_t slot{};
     };
 
     class IddFrameCapture
@@ -41,6 +43,8 @@ namespace tabletdisplay::host
         void SetMonitorConnected(bool connected, MonitorModeRequest modes = {});
         void SetSharedTransport(bool enabled, std::uint64_t generation = 0);
         [[nodiscard]] bool UsesSharedTransport() const noexcept;
+        // The zero-based driver monitor slot leased by the last connection request.
+        [[nodiscard]] std::uint32_t MonitorSlot() const noexcept;
 
     private:
         struct Impl;

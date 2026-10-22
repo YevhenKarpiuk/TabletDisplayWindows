@@ -29,52 +29,65 @@ using namespace Microsoft::WRL;
 
 #pragma region SampleMonitors
 
-static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 1;
 static constexpr GUID TABLET_DISPLAY_MONITOR_CONTAINER_ID =
 { 0x05211a31, 0x67e4, 0x4536, { 0x9d, 0x42, 0xae, 0xfc, 0xdf, 0x0a, 0xf1, 0x83 } };
 
-// FOR SAMPLE PURPOSES ONLY, Static info about monitors that will be reported to OS
-static const struct IndirectSampleMonitor s_SampleMonitors[] =
+// Modified EDID from Dell S2719DGF. Monitor slot 0 reports it unchanged, so the first tablet
+// keeps the display layout Windows saved before several tablets were supported.
+static constexpr BYTE s_BaseEdid[IndirectSampleMonitor::szEdidBlock] =
 {
-    // Modified EDID from Dell S2719DGF
-    {
-        {
-            0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x10,0xAC,0xE6,0xD0,0x55,0x5A,0x4A,0x30,0x24,0x1D,0x01,
-            0x04,0xA5,0x3C,0x22,0x78,0xFB,0x6C,0xE5,0xA5,0x55,0x50,0xA0,0x23,0x0B,0x50,0x54,0x00,0x02,0x00,
-            0xD1,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x58,0xE3,0x00,
-            0xA0,0xA0,0xA0,0x29,0x50,0x30,0x20,0x35,0x00,0x55,0x50,0x21,0x00,0x00,0x1A,0x00,0x00,0x00,0xFF,
-            0x00,0x37,0x4A,0x51,0x58,0x42,0x59,0x32,0x0A,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFC,0x00,
-            0x53,0x32,0x37,0x31,0x39,0x44,0x47,0x46,0x0A,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFD,0x00,0x28,
-            0x9B,0xFA,0xFA,0x40,0x01,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x2C
-        },
-        {
-            { 1920, 1200, 60 },
-            { 1920, 1200, 30 },
-            { 1280,  800, 60 },
-            { 1280,  800, 30 },
-        },
-        0
-    },
-    // Modified EDID from Lenovo Y27fA
-    {
-        {
-            0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x30,0xAE,0xBF,0x65,0x01,0x01,0x01,0x01,0x20,0x1A,0x01,
-            0x04,0xA5,0x3C,0x22,0x78,0x3B,0xEE,0xD1,0xA5,0x55,0x48,0x9B,0x26,0x12,0x50,0x54,0x00,0x08,0x00,
-            0xA9,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x68,0xD8,0x00,
-            0x18,0xF1,0x70,0x2D,0x80,0x58,0x2C,0x45,0x00,0x53,0x50,0x21,0x00,0x00,0x1E,0x00,0x00,0x00,0x10,
-            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFD,0x00,
-            0x30,0x92,0xB4,0xB4,0x22,0x01,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFC,0x00,0x4C,
-            0x45,0x4E,0x20,0x59,0x32,0x37,0x66,0x41,0x0A,0x20,0x20,0x20,0x00,0x11
-        },
-        {
-            { 1920, 1200, 60 },
-            { 1920, 1200, 30 },
-            { 1280,  800, 60 },
-            { 1280,  800, 30 },
-        },
-        0
-    }
+    0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00,0x10,0xAC,0xE6,0xD0,0x55,0x5A,0x4A,0x30,0x24,0x1D,0x01,
+    0x04,0xA5,0x3C,0x22,0x78,0xFB,0x6C,0xE5,0xA5,0x55,0x50,0xA0,0x23,0x0B,0x50,0x54,0x00,0x02,0x00,
+    0xD1,0xC0,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x01,0x58,0xE3,0x00,
+    0xA0,0xA0,0xA0,0x29,0x50,0x30,0x20,0x35,0x00,0x55,0x50,0x21,0x00,0x00,0x1A,0x00,0x00,0x00,0xFF,
+    0x00,0x37,0x4A,0x51,0x58,0x42,0x59,0x32,0x0A,0x20,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFC,0x00,
+    0x53,0x32,0x37,0x31,0x39,0x44,0x47,0x46,0x0A,0x20,0x20,0x20,0x20,0x00,0x00,0x00,0xFD,0x00,0x28,
+    0x9B,0xFA,0xFA,0x40,0x01,0x0A,0x20,0x20,0x20,0x20,0x20,0x20,0x00,0x2C
 };
+
+namespace
+{
+    struct SlotEdid
+    {
+        BYTE Bytes[IndirectSampleMonitor::szEdidBlock];
+    };
+
+    // Every slot has its own product code (bytes 10-11), serial number (byte 12) and checksum,
+    // so Windows identifies each tablet monitor separately.
+    SlotEdid MakeSlotEdid(UINT slot)
+    {
+        SlotEdid edid{};
+        memcpy(edid.Bytes, s_BaseEdid, sizeof(edid.Bytes));
+        if (slot == 0)
+            return edid;
+        const auto productCode = tabletdisplay::ipc::EdidProductCode(slot);
+        edid.Bytes[10] = static_cast<BYTE>(productCode & 0xFF);
+        edid.Bytes[11] = static_cast<BYTE>(productCode >> 8);
+        edid.Bytes[12] = static_cast<BYTE>(edid.Bytes[12] + slot);
+        BYTE sum = 0;
+        for (size_t index = 0; index + 1 < sizeof(edid.Bytes); ++index)
+            sum = static_cast<BYTE>(sum + edid.Bytes[index]);
+        edid.Bytes[sizeof(edid.Bytes) - 1] = static_cast<BYTE>(0x100 - sum);
+        return edid;
+    }
+
+    const SlotEdid& EdidForSlot(UINT slot)
+    {
+        static const SlotEdid edids[tabletdisplay::ipc::kMaxMonitors] =
+        {
+            MakeSlotEdid(0), MakeSlotEdid(1), MakeSlotEdid(2), MakeSlotEdid(3)
+        };
+        static_assert(tabletdisplay::ipc::kMaxMonitors == 4);
+        return edids[slot];
+    }
+
+    GUID ContainerIdForSlot(UINT slot)
+    {
+        auto containerId = TABLET_DISPLAY_MONITOR_CONTAINER_ID;
+        containerId.Data4[7] = static_cast<unsigned char>(containerId.Data4[7] + slot);
+        return containerId;
+    }
+}
 
 #pragma endregion
 
@@ -90,30 +103,36 @@ namespace
     };
 
     // Set by the Host before monitor arrival: the tablet panel resolution and the divisor the
-    // user selected. IddCx asks for monitor and target modes during arrival.
-    SRWLOCK s_TabletModeLock = SRWLOCK_INIT;
-    UINT s_TabletNativeWidth = 0;
-    UINT s_TabletNativeHeight = 0;
-    UINT s_TabletPreferredDivisor = tabletdisplay::display::kMinResolutionDivisor;
+    // user selected, per monitor slot. IddCx asks for monitor and target modes during arrival.
+    struct TabletModeRequest
+    {
+        UINT NativeWidth;
+        UINT NativeHeight;
+        UINT PreferredDivisor;
+    };
 
-    void SetTabletModes(UINT nativeWidth, UINT nativeHeight, UINT preferredDivisor)
+    SRWLOCK s_TabletModeLock = SRWLOCK_INIT;
+    TabletModeRequest s_TabletModes[tabletdisplay::ipc::kMaxMonitors] = {};
+
+    void SetTabletModes(UINT slot, UINT nativeWidth, UINT nativeHeight, UINT preferredDivisor)
     {
         AcquireSRWLockExclusive(&s_TabletModeLock);
-        s_TabletNativeWidth = nativeWidth;
-        s_TabletNativeHeight = nativeHeight;
-        s_TabletPreferredDivisor = preferredDivisor;
+        s_TabletModes[slot] = { nativeWidth, nativeHeight, preferredDivisor };
         ReleaseSRWLockExclusive(&s_TabletModeLock);
     }
 
     // The tablet resolution divided by 1..4 keeps the tablet aspect ratio; each size is
     // offered at 60 and 30 Hz. Without a tablet resolution the legacy modes are reported.
-    vector<TabletMode> CurrentTabletModes(DWORD* preferredIndex)
+    vector<TabletMode> CurrentTabletModes(UINT slot, DWORD* preferredIndex)
     {
         AcquireSRWLockShared(&s_TabletModeLock);
-        const auto nativeWidth = s_TabletNativeWidth;
-        const auto nativeHeight = s_TabletNativeHeight;
-        const auto preferredDivisor = s_TabletPreferredDivisor;
+        const auto request = slot < tabletdisplay::ipc::kMaxMonitors
+            ? s_TabletModes[slot]
+            : TabletModeRequest{};
         ReleaseSRWLockShared(&s_TabletModeLock);
+        const auto nativeWidth = request.NativeWidth;
+        const auto nativeHeight = request.NativeHeight;
+        const auto preferredDivisor = request.PreferredDivisor;
 
         vector<TabletMode> modes;
         DWORD preferred = 0;
@@ -1038,23 +1057,33 @@ void SwapChainProcessor::RunCore()
 IndirectDeviceContext::IndirectDeviceContext(_In_ WDFDEVICE WdfDevice) :
     m_WdfDevice(WdfDevice),
     m_Adapter{},
-    m_Monitor{},
-    m_Frames(make_shared<FrameStore>()),
-    m_MonitorLeaseFile{},
-    m_MonitorConnected{},
-    m_AdapterReady{},
-    m_ConnectorIndex{}
+    m_AdapterReady{}
 {
+    for (auto& Slot : m_Slots)
+        Slot.Frames = make_shared<FrameStore>();
 }
 
 IndirectDeviceContext::~IndirectDeviceContext()
 {
 }
 
-bool IndirectDeviceContext::IsMonitorLeaseOwner(WDFFILEOBJECT fileObject)
+IndirectDeviceContext::MonitorSlot* IndirectDeviceContext::LeasedSlotLocked(WDFFILEOBJECT fileObject)
+{
+    if (fileObject == nullptr)
+        return nullptr;
+    for (auto& Slot : m_Slots)
+    {
+        if (Slot.LeaseFile == fileObject)
+            return &Slot;
+    }
+    return nullptr;
+}
+
+shared_ptr<FrameStore> IndirectDeviceContext::LeasedFrames(WDFFILEOBJECT fileObject)
 {
     lock_guard lock(m_MonitorMutex);
-    return fileObject != nullptr && m_MonitorLeaseFile == fileObject;
+    const auto* Slot = LeasedSlotLocked(fileObject);
+    return Slot != nullptr ? Slot->Frames : nullptr;
 }
 
 // Frames and the frame transport belong to the process that connected the monitor, so other
@@ -1066,9 +1095,10 @@ NTSTATUS IndirectDeviceContext::CopyLatestFrame(
     size_t outputBytes,
     size_t* bytesWritten)
 {
-    if (!IsMonitorLeaseOwner(fileObject))
+    const auto Frames = LeasedFrames(fileObject);
+    if (!Frames)
         return STATUS_ACCESS_DENIED;
-    return m_Frames->CopyLatest(afterSequence, output, outputBytes, bytesWritten);
+    return Frames->CopyLatest(afterSequence, output, outputBytes, bytesWritten);
 }
 
 NTSTATUS IndirectDeviceContext::CopySharedFrame(
@@ -1079,9 +1109,10 @@ NTSTATUS IndirectDeviceContext::CopySharedFrame(
     size_t outputBytes,
     size_t* bytesWritten)
 {
-    if (!IsMonitorLeaseOwner(fileObject))
+    const auto Frames = LeasedFrames(fileObject);
+    if (!Frames)
         return STATUS_ACCESS_DENIED;
-    return m_Frames->CopyShared(
+    return Frames->CopyShared(
         afterSequence, afterGeneration, output, outputBytes, bytesWritten);
 }
 
@@ -1090,17 +1121,21 @@ NTSTATUS IndirectDeviceContext::SetFrameTransport(
     UINT mode,
     UINT64 generation)
 {
-    if (!IsMonitorLeaseOwner(fileObject))
+    const auto Frames = LeasedFrames(fileObject);
+    if (!Frames)
         return STATUS_ACCESS_DENIED;
-    return m_Frames->SetTransport(mode, generation);
+    return Frames->SetTransport(mode, generation);
 }
 
+// requestedSlot 0 leases the first free monitor, N leases monitor N - 1.
 NTSTATUS IndirectDeviceContext::SetMonitorConnection(
     WDFFILEOBJECT fileObject,
     bool connected,
     UINT nativeWidth,
     UINT nativeHeight,
-    UINT preferredDivisor)
+    UINT preferredDivisor,
+    UINT requestedSlot,
+    UINT* leasedSlot)
 {
     if (fileObject == nullptr)
         return STATUS_INVALID_HANDLE;
@@ -1109,66 +1144,91 @@ NTSTATUS IndirectDeviceContext::SetMonitorConnection(
     if (!m_AdapterReady)
         return STATUS_DEVICE_NOT_READY;
 
+    auto* Slot = LeasedSlotLocked(fileObject);
     if (connected)
     {
-        if (m_MonitorLeaseFile != nullptr && m_MonitorLeaseFile != fileObject)
-            return STATUS_DEVICE_BUSY;
+        if (Slot != nullptr)
+        {
+            if (requestedSlot != 0 && &m_Slots[requestedSlot - 1] != Slot)
+                return STATUS_INVALID_PARAMETER;
+        }
+        else if (requestedSlot != 0)
+        {
+            Slot = &m_Slots[requestedSlot - 1];
+            if (Slot->LeaseFile != nullptr)
+                return STATUS_DEVICE_BUSY;
+        }
+        else
+        {
+            for (auto& Candidate : m_Slots)
+            {
+                if (Candidate.LeaseFile == nullptr)
+                {
+                    Slot = &Candidate;
+                    break;
+                }
+            }
+            if (Slot == nullptr)
+                return STATUS_DEVICE_BUSY;
+        }
 
-        if (!m_MonitorConnected)
+        const auto SlotIndex = static_cast<UINT>(Slot - m_Slots);
+        if (!Slot->Connected)
         {
             // Monitor modes are queried during arrival, so they must be known before it.
-            SetTabletModes(nativeWidth, nativeHeight, preferredDivisor);
-            if (m_Monitor == nullptr)
+            SetTabletModes(SlotIndex, nativeWidth, nativeHeight, preferredDivisor);
+            if (Slot->Monitor == nullptr)
             {
-                const auto Status = CreateMonitorLocked();
+                const auto Status = CreateMonitorLocked(SlotIndex);
                 if (!NT_SUCCESS(Status))
                     return Status;
             }
-            if (m_Monitor == nullptr)
+            if (Slot->Monitor == nullptr)
                 return STATUS_DEVICE_NOT_READY;
             IDARG_OUT_MONITORARRIVAL ArrivalOut{};
-            const auto Status = IddCxMonitorArrival(m_Monitor, &ArrivalOut);
+            const auto Status = IddCxMonitorArrival(Slot->Monitor, &ArrivalOut);
             if (!NT_SUCCESS(Status))
             {
-                WdfObjectDelete(m_Monitor);
-                m_Monitor = nullptr;
+                WdfObjectDelete(Slot->Monitor);
+                Slot->Monitor = nullptr;
                 return Status;
             }
-            m_MonitorConnected = true;
+            Slot->Connected = true;
         }
-        m_MonitorLeaseFile = fileObject;
+        Slot->LeaseFile = fileObject;
+        if (leasedSlot != nullptr)
+            *leasedSlot = SlotIndex;
         return STATUS_SUCCESS;
     }
 
-    if (m_MonitorLeaseFile == nullptr)
+    if (Slot == nullptr)
         return STATUS_SUCCESS;
-    if (m_MonitorLeaseFile != fileObject)
-        return STATUS_ACCESS_DENIED;
 
-    if (m_MonitorConnected)
+    if (Slot->Connected)
     {
-        const auto Status = IddCxMonitorDeparture(m_Monitor);
+        const auto Status = IddCxMonitorDeparture(Slot->Monitor);
         if (!NT_SUCCESS(Status))
             return Status;
-        m_MonitorConnected = false;
-        m_Monitor = nullptr;
+        Slot->Connected = false;
+        Slot->Monitor = nullptr;
     }
-    m_MonitorLeaseFile = nullptr;
+    Slot->LeaseFile = nullptr;
     return STATUS_SUCCESS;
 }
 
 void IndirectDeviceContext::ReleaseMonitorConnection(WDFFILEOBJECT fileObject) noexcept
 {
     lock_guard lock(m_MonitorMutex);
-    if (fileObject == nullptr || m_MonitorLeaseFile != fileObject)
+    auto* Slot = LeasedSlotLocked(fileObject);
+    if (Slot == nullptr)
         return;
 
-    if (m_MonitorConnected && NT_SUCCESS(IddCxMonitorDeparture(m_Monitor)))
+    if (Slot->Connected && NT_SUCCESS(IddCxMonitorDeparture(Slot->Monitor)))
     {
-        m_MonitorConnected = false;
-        m_Monitor = nullptr;
+        Slot->Connected = false;
+        Slot->Monitor = nullptr;
     }
-    m_MonitorLeaseFile = nullptr;
+    Slot->LeaseFile = nullptr;
 }
 
 void IndirectDeviceContext::InitAdapter()
@@ -1184,7 +1244,7 @@ void IndirectDeviceContext::InitAdapter()
     AdapterCaps.Size = sizeof(AdapterCaps);
 
     // Declare basic feature support for the adapter (required)
-    AdapterCaps.MaxMonitorsSupported = IDD_SAMPLE_MONITOR_COUNT;
+    AdapterCaps.MaxMonitorsSupported = tabletdisplay::ipc::kMaxMonitors;
     AdapterCaps.EndPointDiagnostics.Size = sizeof(AdapterCaps.EndPointDiagnostics);
     AdapterCaps.EndPointDiagnostics.GammaSupport = IDDCX_FEATURE_IMPLEMENTATION_NONE;
     AdapterCaps.EndPointDiagnostics.TransmissionType = IDDCX_TRANSMISSION_TYPE_WIRED_OTHER;
@@ -1225,16 +1285,14 @@ void IndirectDeviceContext::InitAdapter()
     }
 }
 
-void IndirectDeviceContext::FinishInit(UINT ConnectorIndex)
+void IndirectDeviceContext::FinishInit()
 {
     lock_guard lock(m_MonitorMutex);
-    m_ConnectorIndex = ConnectorIndex;
     m_AdapterReady = true;
 }
 
-NTSTATUS IndirectDeviceContext::CreateMonitorLocked()
+NTSTATUS IndirectDeviceContext::CreateMonitorLocked(UINT slot)
 {
-
     // ==============================
     // TODO: In a real driver, the EDID should be retrieved dynamically from a connected physical monitor. The EDIDs
     // provided here are purely for demonstration.
@@ -1256,23 +1314,15 @@ NTSTATUS IndirectDeviceContext::CreateMonitorLocked()
     IDDCX_MONITOR_INFO MonitorInfo = {};
     MonitorInfo.Size = sizeof(MonitorInfo);
     MonitorInfo.MonitorType = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-    MonitorInfo.ConnectorIndex = m_ConnectorIndex;
+    MonitorInfo.ConnectorIndex = slot;
 
     MonitorInfo.MonitorDescription.Size = sizeof(MonitorInfo.MonitorDescription);
     MonitorInfo.MonitorDescription.Type = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    if (m_ConnectorIndex >= ARRAYSIZE(s_SampleMonitors))
-    {
-        MonitorInfo.MonitorDescription.DataSize = 0;
-        MonitorInfo.MonitorDescription.pData = nullptr;
-    }
-    else
-    {
-        MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
-        MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(s_SampleMonitors[m_ConnectorIndex].pEdidBlock);
-    }
+    MonitorInfo.MonitorDescription.DataSize = IndirectSampleMonitor::szEdidBlock;
+    MonitorInfo.MonitorDescription.pData = const_cast<BYTE*>(EdidForSlot(slot).Bytes);
 
-    // The same tablet display reconnects repeatedly, so its identity must remain stable.
-    MonitorInfo.MonitorContainerId = TABLET_DISPLAY_MONITOR_CONTAINER_ID;
+    // The same tablet display reconnects repeatedly, so each slot's identity must remain stable.
+    MonitorInfo.MonitorContainerId = ContainerIdForSlot(slot);
 
     IDARG_IN_MONITORCREATE MonitorCreate = {};
     MonitorCreate.ObjectAttributes = &Attr;
@@ -1287,16 +1337,18 @@ NTSTATUS IndirectDeviceContext::CreateMonitorLocked()
         auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorCreateOut.MonitorObject);
         pMonitorContextWrapper->pContext = new IndirectMonitorContext(
             MonitorCreateOut.MonitorObject,
-            m_Frames);
-        m_Monitor = MonitorCreateOut.MonitorObject;
+            slot,
+            m_Slots[slot].Frames);
+        m_Slots[slot].Monitor = MonitorCreateOut.MonitorObject;
     }
     return Status;
 }
 
 IndirectMonitorContext::IndirectMonitorContext(
     _In_ IDDCX_MONITOR Monitor,
+    UINT Slot,
     shared_ptr<FrameStore> Frames) :
-    m_Monitor(Monitor), m_Frames(Frames)
+    m_Monitor(Monitor), m_Slot(Slot), m_Frames(Frames)
 {
 }
 
@@ -1336,6 +1388,14 @@ void IndirectMonitorContext::UnassignSwapChain()
 #pragma endregion
 
 #pragma region DDI Callbacks
+
+static UINT MonitorSlot(IDDCX_MONITOR MonitorObject)
+{
+    const auto* pMonitorContextWrapper = WdfObjectGet_IndirectMonitorContextWrapper(MonitorObject);
+    return pMonitorContextWrapper != nullptr && pMonitorContextWrapper->pContext != nullptr
+        ? pMonitorContextWrapper->pContext->Slot()
+        : tabletdisplay::ipc::kMaxMonitors;
+}
 
 _Use_decl_annotations_
 VOID IddSampleDeviceIoControl(
@@ -1500,7 +1560,7 @@ VOID IddSampleDeviceIoControl(
             if (NT_SUCCESS(Status) &&
                 (ConnectionRequest->structureBytes != sizeof(*ConnectionRequest) ||
                  ConnectionRequest->connected > 1 ||
-                 ConnectionRequest->reserved != 0))
+                 ConnectionRequest->slot > tabletdisplay::ipc::kMaxMonitors))
             {
                 Status = STATUS_INVALID_PARAMETER;
             }
@@ -1531,12 +1591,29 @@ VOID IddSampleDeviceIoControl(
                 }
                 else
                 {
+                    UINT LeasedSlot = 0;
                     Status = DeviceContext->pContext->SetMonitorConnection(
                         FileObject,
                         ConnectionRequest->connected != 0,
                         ConnectionRequest->nativeWidth,
                         ConnectionRequest->nativeHeight,
-                        PreferredDivisor);
+                        PreferredDivisor,
+                        ConnectionRequest->slot,
+                        &LeasedSlot);
+                    // Hosts that know about several monitors pass an output buffer for the slot.
+                    tabletdisplay::ipc::MonitorConnectionResponse* Response = nullptr;
+                    if (NT_SUCCESS(Status) && ConnectionRequest->connected != 0 &&
+                        OutputBufferLength >= sizeof(*Response) &&
+                        NT_SUCCESS(WdfRequestRetrieveOutputBuffer(
+                            Request,
+                            sizeof(*Response),
+                            reinterpret_cast<void**>(&Response),
+                            nullptr)))
+                    {
+                        *Response = {};
+                        Response->slot = LeasedSlot;
+                        BytesWritten = sizeof(*Response);
+                    }
                 }
             }
         }
@@ -1563,10 +1640,7 @@ NTSTATUS IddSampleAdapterInitFinished(IDDCX_ADAPTER AdapterObject, const IDARG_I
     auto* pDeviceContextWrapper = WdfObjectGet_IndirectDeviceContextWrapper(AdapterObject);
     if (NT_SUCCESS(pInArgs->AdapterInitStatus))
     {
-        for (DWORD i = 0; i < IDD_SAMPLE_MONITOR_COUNT; i++)
-        {
-            pDeviceContextWrapper->pContext->FinishInit(i);
-        }
+        pDeviceContextWrapper->pContext->FinishInit();
     }
 
     return STATUS_SUCCESS;
@@ -1597,8 +1671,21 @@ NTSTATUS IddSampleParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION
     // this sample driver, we hard-code the EDID, so this function can generate known modes.
     // ==============================
 
+    // The EDID only identifies the monitor slot; its modes follow that slot's tablet resolution.
+    if (pInArgs->MonitorDescription.DataSize != IndirectSampleMonitor::szEdidBlock)
+        return STATUS_INVALID_PARAMETER;
+    UINT Slot = 0;
+    for (; Slot < tabletdisplay::ipc::kMaxMonitors; Slot++)
+    {
+        if (memcmp(pInArgs->MonitorDescription.pData, EdidForSlot(Slot).Bytes, IndirectSampleMonitor::szEdidBlock) == 0)
+            break;
+    }
+    // This EDID block does not belong to the monitors we reported earlier
+    if (Slot == tabletdisplay::ipc::kMaxMonitors)
+        return STATUS_INVALID_PARAMETER;
+
     DWORD PreferredModeIndex = 0;
-    const auto Modes = CurrentTabletModes(&PreferredModeIndex);
+    const auto Modes = CurrentTabletModes(Slot, &PreferredModeIndex);
     pOutArgs->MonitorModeBufferOutputCount = static_cast<UINT>(Modes.size());
 
     if (pInArgs->MonitorModeBufferInputCount < Modes.size())
@@ -1608,45 +1695,25 @@ NTSTATUS IddSampleParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION
     }
     else
     {
-        // In the sample driver, we have reported some static information about connected monitors
-        // Check which of the reported monitors this call is for by comparing it to the pointer of
-        // our known EDID blocks.
-
-        if (pInArgs->MonitorDescription.DataSize != IndirectSampleMonitor::szEdidBlock)
-            return STATUS_INVALID_PARAMETER;
-
-        DWORD SampleMonitorIdx = 0;
-        for(; SampleMonitorIdx < ARRAYSIZE(s_SampleMonitors); SampleMonitorIdx++)
+        for (size_t ModeIndex = 0; ModeIndex < Modes.size(); ModeIndex++)
         {
-            if (memcmp(pInArgs->MonitorDescription.pData, s_SampleMonitors[SampleMonitorIdx].pEdidBlock, IndirectSampleMonitor::szEdidBlock) == 0)
-            {
-                // The EDID only identifies the monitor; its modes follow the tablet resolution.
-                for (size_t ModeIndex = 0; ModeIndex < Modes.size(); ModeIndex++)
-                {
-                    pInArgs->pMonitorModes[ModeIndex] = CreateIddCxMonitorMode(
-                        Modes[ModeIndex].Width,
-                        Modes[ModeIndex].Height,
-                        Modes[ModeIndex].VSync,
-                        IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
-                    );
-                }
-
-                pOutArgs->PreferredMonitorModeIdx = PreferredModeIndex;
-
-                return STATUS_SUCCESS;
-            }
+            pInArgs->pMonitorModes[ModeIndex] = CreateIddCxMonitorMode(
+                Modes[ModeIndex].Width,
+                Modes[ModeIndex].Height,
+                Modes[ModeIndex].VSync,
+                IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
+            );
         }
 
-        // This EDID block does not belong to the monitors we reported earlier
-        return STATUS_INVALID_PARAMETER;
+        pOutArgs->PreferredMonitorModeIdx = PreferredModeIndex;
+
+        return STATUS_SUCCESS;
     }
 }
 
 _Use_decl_annotations_
 NTSTATUS IddSampleMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_GETDEFAULTDESCRIPTIONMODES* pInArgs, IDARG_OUT_GETDEFAULTDESCRIPTIONMODES* pOutArgs)
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
-
     // ==============================
     // TODO: In a real driver, this function would be called to generate monitor modes for a monitor with no EDID.
     // Drivers should report modes that are guaranteed to be supported by the transport protocol and by nearly all
@@ -1655,7 +1722,7 @@ NTSTATUS IddSampleMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDAR
     // ==============================
 
     DWORD PreferredModeIndex = 0;
-    const auto Modes = CurrentTabletModes(&PreferredModeIndex);
+    const auto Modes = CurrentTabletModes(MonitorSlot(MonitorObject), &PreferredModeIndex);
     pOutArgs->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(Modes.size());
     if (pInArgs->DefaultMonitorModeBufferInputCount != 0)
     {
@@ -1679,15 +1746,13 @@ NTSTATUS IddSampleMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDAR
 _Use_decl_annotations_
 NTSTATUS IddSampleMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_QUERYTARGETMODES* pInArgs, IDARG_OUT_QUERYTARGETMODES* pOutArgs)
 {
-    UNREFERENCED_PARAMETER(MonitorObject);
-
     vector<IDDCX_TARGET_MODE> TargetModes;
 
     // Create a set of modes supported for frame processing and scan-out. These are typically not based on the
     // monitor's descriptor and instead are based on the static processing capability of the device. The OS will
     // report the available set of modes for a given output as the intersection of monitor modes with target modes.
 
-    for (const auto& Mode : CurrentTabletModes(nullptr))
+    for (const auto& Mode : CurrentTabletModes(MonitorSlot(MonitorObject), nullptr))
     {
         TargetModes.push_back(CreateIddCxTargetMode(Mode.Width, Mode.Height, Mode.VSync));
     }

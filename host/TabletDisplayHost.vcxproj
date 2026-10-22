@@ -61,6 +61,7 @@
     <ClCompile Include="src\DesktopCapture.cpp" />
     <ClCompile Include="src\IddFrameCapture.cpp" />
     <ClCompile Include="src\MediaFoundationH264Encoder.cpp" />
+    <ClCompile Include="src\TabletMonitors.cpp" />
     <ClCompile Include="..\shared\protocol\Protocol.cpp" />
     <ClCompile Include="..\shared\video\SyntheticH264.cpp" />
     <ClCompile Include="..\shared\video\VideoProcessing.cpp" />
@@ -69,6 +70,7 @@
     <ClInclude Include="src\DesktopCapture.h" />
     <ClInclude Include="src\IddFrameCapture.h" />
     <ClInclude Include="src\MediaFoundationH264Encoder.h" />
+    <ClInclude Include="src\TabletMonitors.h" />
     <ClInclude Include="..\shared\protocol\Protocol.h" />
     <ClInclude Include="..\shared\protocol\ProtocolConstants.h" />
     <ClInclude Include="..\shared\ipc\FrameTransport.h" />

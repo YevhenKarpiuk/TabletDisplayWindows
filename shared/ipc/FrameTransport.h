@@ -86,8 +86,14 @@ namespace tabletdisplay::ipc
         std::uint64_t generation{};
     };
 
+    // The driver offers one monitor per connected tablet; each Host process (driver file
+    // object) leases one monitor slot and receives only that monitor's frames.
+    inline constexpr std::uint32_t kMaxMonitors = 4;
+
     // nativeWidth/nativeHeight describe the tablet panel; the monitor offers that resolution
     // divided by 1..4. Zero keeps the legacy 1920x1200/1280x800 mode list.
+    // slot 0 leases the first free monitor; slot N (1..kMaxMonitors) asks for monitor N - 1,
+    // so a tablet keeps its Windows display position across reconnects.
     struct MonitorConnectionRequest
     {
         std::uint32_t structureBytes{ sizeof(MonitorConnectionRequest) };
@@ -95,8 +101,25 @@ namespace tabletdisplay::ipc
         std::uint16_t nativeWidth{};
         std::uint16_t nativeHeight{};
         std::uint16_t preferredDivisor{};
-        std::uint16_t reserved{};
+        std::uint16_t slot{};
     };
+
+    // Optional output of kSetMonitorConnectionIoctl: the zero-based leased monitor slot.
+    struct MonitorConnectionResponse
+    {
+        std::uint32_t structureBytes{ sizeof(MonitorConnectionResponse) };
+        std::uint32_t slot{};
+    };
+
+    // Each monitor slot reports its own EDID: the base EDID with the product code and serial
+    // number advanced by the slot, so Windows keeps a separate layout for every tablet.
+    inline constexpr std::uint16_t kEdidManufacturerId = 0x10AC; // "DEL", big-endian in the EDID.
+    inline constexpr std::uint16_t kEdidBaseProductCode = 0xD0E6;
+
+    [[nodiscard]] constexpr std::uint16_t EdidProductCode(std::uint32_t slot) noexcept
+    {
+        return static_cast<std::uint16_t>(kEdidBaseProductCode + slot);
+    }
 
     inline constexpr ULONG kGetLatestFrameIoctl = CTL_CODE(
         FILE_DEVICE_UNKNOWN,
@@ -125,4 +148,5 @@ namespace tabletdisplay::ipc
     static_assert(sizeof(SharedFrameResponse) == 256);
     static_assert(sizeof(FrameTransportRequest) == 16);
     static_assert(sizeof(MonitorConnectionRequest) == 16);
+    static_assert(sizeof(MonitorConnectionResponse) == 8);
 }
