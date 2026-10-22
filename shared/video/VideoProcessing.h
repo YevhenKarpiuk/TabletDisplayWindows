@@ -45,4 +45,8 @@ namespace tabletdisplay::video
         std::span<const std::uint8_t> bytes);
     [[nodiscard]] std::vector<std::uint8_t> ExtractAnnexBParameterSets(
         std::span<const std::uint8_t> accessUnit);
+    // Rewrites every SPS in an Annex B buffer with VUI bitstream_restriction set to
+    // max_num_reorder_frames = 0 and a one-frame DPB, so decoders output each picture at once.
+    [[nodiscard]] std::vector<std::uint8_t> PatchSpsForLowLatency(
+        std::span<const std::uint8_t> annexB);
 }

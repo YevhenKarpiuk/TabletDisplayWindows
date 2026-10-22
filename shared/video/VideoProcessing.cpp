@@ -85,6 +85,299 @@ namespace tabletdisplay::video
             output.insert(output.end(), bytes.begin() + offset, bytes.begin() + offset + length);
             offset += length;
         }
+
+        // Bit-level access to an H.264 RBSP (emulation prevention bytes already removed).
+        class RbspReader
+        {
+        public:
+            explicit RbspReader(std::span<const std::uint8_t> bytes) noexcept : m_bytes(bytes) {}
+
+            [[nodiscard]] std::uint32_t Bits(unsigned count)
+            {
+                std::uint32_t value{};
+                for (unsigned index = 0; index < count; ++index)
+                {
+                    if (m_position >= m_bytes.size() * 8U) throw std::runtime_error("Truncated H.264 SPS");
+                    const auto bit = (m_bytes[m_position / 8U] >> (7U - m_position % 8U)) & 1U;
+                    value = (value << 1U) | bit;
+                    ++m_position;
+                }
+                return value;
+            }
+
+            [[nodiscard]] std::uint32_t Ue()
+            {
+                unsigned leadingZeros{};
+                while (Bits(1) == 0)
+                {
+                    if (++leadingZeros > 31) throw std::runtime_error("Invalid Exp-Golomb code in H.264 SPS");
+                }
+                if (leadingZeros == 0) return 0;
+                return static_cast<std::uint32_t>((1ULL << leadingZeros) - 1U + Bits(leadingZeros));
+            }
+
+        private:
+            std::span<const std::uint8_t> m_bytes;
+            std::size_t m_position{};
+        };
+
+        class RbspWriter
+        {
+        public:
+            void Bits(std::uint32_t value, unsigned count)
+            {
+                for (unsigned index = count; index-- > 0;)
+                {
+                    if (m_bitCount % 8U == 0) m_bytes.push_back(0);
+                    if (((value >> index) & 1U) != 0)
+                        m_bytes.back() = static_cast<std::uint8_t>(m_bytes.back() | (0x80U >> (m_bitCount % 8U)));
+                    ++m_bitCount;
+                }
+            }
+
+            void Ue(std::uint32_t value)
+            {
+                const auto coded = static_cast<std::uint64_t>(value) + 1U;
+                unsigned length{};
+                while ((coded >> (length + 1U)) != 0) ++length;
+                Bits(0, length);
+                Bits(1, 1);
+                Bits(static_cast<std::uint32_t>(coded - (1ULL << length)), length);
+            }
+
+            [[nodiscard]] std::vector<std::uint8_t> FinishWithTrailingBits()
+            {
+                Bits(1, 1);
+                while (m_bitCount % 8U != 0) Bits(0, 1);
+                return std::move(m_bytes);
+            }
+
+        private:
+            std::vector<std::uint8_t> m_bytes;
+            std::size_t m_bitCount{};
+        };
+
+        // Copies SPS fields bit for bit; Copy* returns the value so the parser can branch on it.
+        class SpsTranscriber
+        {
+        public:
+            explicit SpsTranscriber(std::span<const std::uint8_t> rbsp) noexcept : m_reader(rbsp) {}
+
+            std::uint32_t Copy(unsigned count)
+            {
+                const auto value = m_reader.Bits(count);
+                m_writer.Bits(value, count);
+                return value;
+            }
+
+            std::uint32_t CopyUe()
+            {
+                const auto value = m_reader.Ue();
+                m_writer.Ue(value);
+                return value;
+            }
+
+            // se(v) shares the ue(v) bit pattern, so it is copied unchanged.
+            void CopySe() { (void)CopyUe(); }
+
+            [[nodiscard]] RbspReader& Reader() noexcept { return m_reader; }
+            [[nodiscard]] RbspWriter& Writer() noexcept { return m_writer; }
+
+        private:
+            RbspReader m_reader;
+            RbspWriter m_writer;
+        };
+
+        void CopyScalingList(SpsTranscriber& sps, unsigned size)
+        {
+            int lastScale = 8;
+            int nextScale = 8;
+            for (unsigned index = 0; index < size; ++index)
+            {
+                if (nextScale != 0)
+                {
+                    const auto code = sps.CopyUe();
+                    const auto delta = (code & 1U) != 0
+                        ? static_cast<int>((code + 1U) / 2U)
+                        : -static_cast<int>(code / 2U);
+                    nextScale = (lastScale + delta + 256) % 256;
+                }
+                lastScale = nextScale == 0 ? lastScale : nextScale;
+            }
+        }
+
+        void CopyHrdParameters(SpsTranscriber& sps)
+        {
+            const auto cpbCount = sps.CopyUe() + 1U;
+            if (cpbCount > 32) throw std::runtime_error("Invalid H.264 HRD cpb_cnt");
+            (void)sps.Copy(4);
+            (void)sps.Copy(4);
+            for (std::uint32_t index = 0; index < cpbCount; ++index)
+            {
+                (void)sps.CopyUe();
+                (void)sps.CopyUe();
+                (void)sps.Copy(1);
+            }
+            (void)sps.Copy(5);
+            (void)sps.Copy(5);
+            (void)sps.Copy(5);
+            (void)sps.Copy(5);
+        }
+
+        [[nodiscard]] std::vector<std::uint8_t> RemoveEmulationPrevention(std::span<const std::uint8_t> nal)
+        {
+            std::vector<std::uint8_t> rbsp;
+            rbsp.reserve(nal.size());
+            unsigned zeros{};
+            for (const auto byte : nal)
+            {
+                if (zeros >= 2 && byte == 3)
+                {
+                    zeros = 0;
+                    continue;
+                }
+                rbsp.push_back(byte);
+                zeros = byte == 0 ? zeros + 1U : 0U;
+            }
+            return rbsp;
+        }
+
+        void AppendWithEmulationPrevention(std::vector<std::uint8_t>& output, std::span<const std::uint8_t> rbsp)
+        {
+            unsigned zeros{};
+            for (const auto byte : rbsp)
+            {
+                if (zeros >= 2 && byte <= 3)
+                {
+                    output.push_back(3);
+                    zeros = 0;
+                }
+                output.push_back(byte);
+                zeros = byte == 0 ? zeros + 1U : 0U;
+            }
+        }
+
+        // Rewrites one SPS NAL (header byte included, no start code) so that the decoder may
+        // output every picture as soon as it is decoded: no reordering and a one-frame DPB.
+        [[nodiscard]] std::vector<std::uint8_t> RewriteSpsForLowLatency(std::span<const std::uint8_t> nal)
+        {
+            const auto rbsp = RemoveEmulationPrevention(nal);
+            SpsTranscriber sps(rbsp);
+            (void)sps.Copy(8);
+            const auto profileIdc = sps.Copy(8);
+            (void)sps.Copy(8);
+            (void)sps.Copy(8);
+            (void)sps.CopyUe();
+            if (profileIdc == 100 || profileIdc == 110 || profileIdc == 122 || profileIdc == 244 ||
+                profileIdc == 44 || profileIdc == 83 || profileIdc == 86 || profileIdc == 118 ||
+                profileIdc == 128 || profileIdc == 138 || profileIdc == 139 || profileIdc == 134 ||
+                profileIdc == 135)
+            {
+                const auto chromaFormatIdc = sps.CopyUe();
+                if (chromaFormatIdc == 3) (void)sps.Copy(1);
+                (void)sps.CopyUe();
+                (void)sps.CopyUe();
+                (void)sps.Copy(1);
+                if (sps.Copy(1) != 0)
+                {
+                    for (unsigned index = 0; index < (chromaFormatIdc == 3 ? 12U : 8U); ++index)
+                    {
+                        if (sps.Copy(1) != 0) CopyScalingList(sps, index < 6 ? 16U : 64U);
+                    }
+                }
+            }
+            (void)sps.CopyUe();
+            const auto pocType = sps.CopyUe();
+            if (pocType == 0)
+            {
+                (void)sps.CopyUe();
+            }
+            else if (pocType == 1)
+            {
+                (void)sps.Copy(1);
+                sps.CopySe();
+                sps.CopySe();
+                const auto cycle = sps.CopyUe();
+                if (cycle > 255) throw std::runtime_error("Invalid H.264 POC cycle");
+                for (std::uint32_t index = 0; index < cycle; ++index) sps.CopySe();
+            }
+            const auto maxNumRefFrames = sps.CopyUe();
+            (void)sps.Copy(1);
+            (void)sps.CopyUe();
+            (void)sps.CopyUe();
+            if (sps.Copy(1) == 0) (void)sps.Copy(1);
+            (void)sps.Copy(1);
+            if (sps.Copy(1) != 0)
+            {
+                for (int index = 0; index < 4; ++index) (void)sps.CopyUe();
+            }
+
+            auto& reader = sps.Reader();
+            auto& writer = sps.Writer();
+            const bool vuiPresent = reader.Bits(1) != 0;
+            writer.Bits(1, 1);
+            bool restrictionPresent{};
+            if (vuiPresent)
+            {
+                if (sps.Copy(1) != 0 && sps.Copy(8) == 255) (void)sps.Copy(32);
+                if (sps.Copy(1) != 0) (void)sps.Copy(1);
+                if (sps.Copy(1) != 0)
+                {
+                    (void)sps.Copy(4);
+                    if (sps.Copy(1) != 0) (void)sps.Copy(24);
+                }
+                if (sps.Copy(1) != 0)
+                {
+                    (void)sps.CopyUe();
+                    (void)sps.CopyUe();
+                }
+                if (sps.Copy(1) != 0)
+                {
+                    (void)sps.Copy(32);
+                    (void)sps.Copy(32);
+                    (void)sps.Copy(1);
+                }
+                const auto nalHrd = sps.Copy(1) != 0;
+                if (nalHrd) CopyHrdParameters(sps);
+                const auto vclHrd = sps.Copy(1) != 0;
+                if (vclHrd) CopyHrdParameters(sps);
+                if (nalHrd || vclHrd) (void)sps.Copy(1);
+                (void)sps.Copy(1);
+                restrictionPresent = reader.Bits(1) != 0;
+            }
+            else
+            {
+                // aspect_ratio, overscan, video_signal_type, chroma_loc, timing, NAL HRD, VCL HRD
+                // and pic_struct are all absent.
+                writer.Bits(0, 8);
+            }
+
+            writer.Bits(1, 1);
+            if (restrictionPresent)
+            {
+                (void)sps.Copy(1);
+                (void)sps.CopyUe();
+                (void)sps.CopyUe();
+                (void)sps.CopyUe();
+                (void)sps.CopyUe();
+                (void)reader.Ue();
+                (void)reader.Ue();
+            }
+            else
+            {
+                writer.Bits(1, 1);
+                writer.Ue(2);
+                writer.Ue(1);
+                writer.Ue(16);
+                writer.Ue(16);
+            }
+            writer.Ue(0);
+            writer.Ue(std::max<std::uint32_t>(1, maxNumRefFrames));
+
+            std::vector<std::uint8_t> output;
+            AppendWithEmulationPrevention(output, writer.FinishWithTrailingBits());
+            return output;
+        }
     }
 
     std::vector<std::uint8_t> BgraToNv12(
@@ -295,6 +588,27 @@ namespace tabletdisplay::video
         }
         if (!AnnexBContainsNalType(output, 7) || !AnnexBContainsNalType(output, 8))
             throw std::runtime_error("H.264 access unit lacks SPS/PPS");
+        return output;
+    }
+
+    std::vector<std::uint8_t> PatchSpsForLowLatency(std::span<const std::uint8_t> annexB)
+    {
+        std::vector<std::uint8_t> output;
+        output.reserve(annexB.size() + 16U);
+        for (const auto [start, end] : AnnexBUnits(annexB))
+        {
+            const auto payload = start + StartCodeLength(annexB, start);
+            if (payload < end && (annexB[payload] & 0x1FU) == 7)
+            {
+                output.insert(output.end(), annexB.begin() + start, annexB.begin() + payload);
+                const auto sps = RewriteSpsForLowLatency(annexB.subspan(payload, end - payload));
+                output.insert(output.end(), sps.begin(), sps.end());
+            }
+            else
+            {
+                output.insert(output.end(), annexB.begin() + start, annexB.begin() + end);
+            }
+        }
         return output;
     }
 }

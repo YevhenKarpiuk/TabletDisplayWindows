@@ -334,6 +334,26 @@ int main(int argc, char* argv[])
         }), "length-prefixed access unit to Annex B");
         Check(tabletdisplay::video::AnnexBContainsNalType(annexB, 5), "Annex B IDR detection");
 
+        // An SPS without VUI gains bitstream_restriction with no reordering and a one-frame DPB;
+        // the expected bytes were checked with FFmpeg's trace_headers.
+        const std::vector<std::uint8_t> spsWithoutVui{
+            0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x28, 0xD9, 0x00, 0x50, 0x06, 0x59,
+            0, 0, 0, 1, 0x68, 0xCE
+        };
+        const auto lowLatencySps = tabletdisplay::video::PatchSpsForLowLatency(spsWithoutVui);
+        Check(lowLatencySps == std::vector<std::uint8_t>({
+            0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x28, 0xD9, 0x00, 0x50, 0x06, 0x5A, 0x01, 0xB4, 0x11, 0x08, 0xC9,
+            0, 0, 0, 1, 0x68, 0xCE
+        }), "low-latency SPS rewrite");
+        Check(tabletdisplay::video::PatchSpsForLowLatency(lowLatencySps) == lowLatencySps,
+            "low-latency SPS rewrite is idempotent");
+        const auto patchedSynthetic =
+            tabletdisplay::video::PatchSpsForLowLatency(synthetic.idrAccessUnit);
+        Check(tabletdisplay::video::AnnexBContainsNalType(patchedSynthetic, 7) &&
+            tabletdisplay::video::AnnexBContainsNalType(patchedSynthetic, 8) &&
+            tabletdisplay::video::AnnexBContainsNalType(patchedSynthetic, 5),
+            "low-latency SPS rewrite keeps the access unit");
+
         const std::vector<std::uint8_t> avcConfig{
             1, 66, 0, 40, 0xFF, 0xE1,
             0, 4, 0x67, 66, 0, 40,

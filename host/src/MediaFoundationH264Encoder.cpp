@@ -471,10 +471,17 @@ namespace tabletdisplay::host
             SetCodecBool(codec.Get(), CODECAPI_AVEncCommonLowLatency, true);
             SetCodecBool(codec.Get(), CODECAPI_AVEncCommonRealTime, true);
             SetCodecBool(codec.Get(), CODECAPI_AVLowLatencyMode, true);
-            SetCodecUint32(codec.Get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+            // Peak-constrained VBR lets a scroll or a newly opened window use up to 2.5x the mean
+            // rate instead of being smeared over several CBR frames; USB carries that easily.
+            SetCodecUint32(codec.Get(), CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_PeakConstrainedVBR);
             SetCodecUint32(codec.Get(), CODECAPI_AVEncCommonQualityVsSpeed, 0);
             SetCodecUint32(codec.Get(), CODECAPI_AVEncCommonMeanBitRate, options.bitrate);
-            SetCodecUint32(codec.Get(), CODECAPI_AVEncMPVGOPSize, std::max<std::uint32_t>(1, options.fps * 2U));
+            SetCodecUint32(codec.Get(), CODECAPI_AVEncCommonMaxBitRate,
+                static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                    static_cast<std::uint64_t>(options.bitrate) * 5U / 2U, 40'000'000U)));
+            // Android requests an IDR when it needs one, so periodic IDR spikes are not needed;
+            // one per minute still bounds how long a corrupted picture could persist.
+            SetCodecUint32(codec.Get(), CODECAPI_AVEncMPVGOPSize, std::max<std::uint32_t>(1, options.fps * 60U));
             SetCodecUint32(codec.Get(), CODECAPI_AVEncMPVDefaultBPictureCount, 0);
             SetCodecUint32(codec.Get(), CODECAPI_AVEncVideoMaxNumRefFrame, 1);
 
@@ -620,6 +627,10 @@ namespace tabletdisplay::host
             {
                 config = tabletdisplay::video::ParseH264CodecConfig(accessUnit);
             }
+            // Without VUI bitstream_restriction a decoder may hold several decoded frames before
+            // showing the first one; the patched SPS lets it output each frame immediately.
+            if (config.has_value())
+                config->annexB = tabletdisplay::video::PatchSpsForLowLatency(config->annexB);
         }
 
         [[nodiscard]] std::optional<EncodedAccessUnit> TryReadOutput()
@@ -677,6 +688,9 @@ namespace tabletdisplay::host
             RefreshCodecConfig(raw);
             const auto lengthSize = config.has_value() ? config->nalLengthSize : static_cast<std::uint8_t>(4);
             auto annexB = tabletdisplay::video::NormalizeH264AccessUnit(raw, lengthSize);
+            // In-band SPS must match VIDEO_CONFIG, which carries the patched SPS as well.
+            if (tabletdisplay::video::AnnexBContainsNalType(annexB, 7))
+                annexB = tabletdisplay::video::PatchSpsForLowLatency(annexB);
             RefreshCodecConfig(annexB);
 
             LONGLONG sampleTime{};

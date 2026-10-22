@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <timeapi.h>
 
 #include "DesktopCapture.h"
 #include "display/DisplayModes.h"
@@ -136,6 +137,32 @@ namespace
     void ReportProgress() noexcept
     {
         g_lastProgressMs = GetTickCount64();
+    }
+
+    // The same clock and conversion as the driver's frame timestamps.
+    [[nodiscard]] std::uint64_t QpcMicroseconds() noexcept
+    {
+        LARGE_INTEGER counter{};
+        LARGE_INTEGER frequency{};
+        QueryPerformanceCounter(&counter);
+        QueryPerformanceFrequency(&frequency);
+        if (frequency.QuadPart <= 0) return 0;
+        return static_cast<std::uint64_t>(counter.QuadPart / frequency.QuadPart) * 1'000'000ULL +
+            static_cast<std::uint64_t>(counter.QuadPart % frequency.QuadPart) * 1'000'000ULL /
+                static_cast<std::uint64_t>(frequency.QuadPart);
+    }
+
+    // Frame polling sleeps for 1 ms, which needs a 1 ms system timer. Windows 11 ignores the
+    // request of a process without a visible window unless it opts out of that throttling.
+    void UseHighResolutionTimer() noexcept
+    {
+        PROCESS_POWER_THROTTLING_STATE throttling{};
+        throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        throttling.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        throttling.StateMask = 0;
+        (void)SetProcessInformation(
+            GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+        (void)timeBeginPeriod(1);
     }
 
     // A hung adb, driver IOCTL or Media Foundation call cannot be cancelled from inside the
@@ -1421,9 +1448,16 @@ namespace
         const auto frameDuration = std::chrono::nanoseconds(1'000'000'000ULL / fps);
         using Clock = std::chrono::steady_clock;
         const auto streamStarted = Clock::now();
-        const auto frameCount = seconds == 0
-            ? std::numeric_limits<std::uint64_t>::max()
-            : static_cast<std::uint64_t>(seconds) * fps;
+        const auto streamDeadline = seconds == 0
+            ? Clock::time_point::max()
+            : streamStarted + std::chrono::seconds(seconds);
+        // Windows presents a new frame only when the picture changes. A few repeats after the
+        // last change let the encoder refine that picture and push it out of a decoder that holds
+        // frames; after that nothing is encoded until the picture changes again.
+        constexpr unsigned kRefinementFrames = 3;
+        // The driver has no frame event, so it is polled; a new frame waits at most this long
+        // instead of up to a whole 60 Hz tick.
+        constexpr auto kCapturePollInterval = std::chrono::milliseconds(1);
 
         struct PreparedFrameSlot
         {
@@ -1432,6 +1466,7 @@ namespace
             std::condition_variable empty;
             tabletdisplay::host::CapturedFrame frame;
             tabletdisplay::host::SharedCapturedFrame sharedFrame;
+            bool newFrame{};
             bool newSharedFrame{};
             bool occupied{};
             bool finished{};
@@ -1448,15 +1483,16 @@ namespace
             slot.empty.notify_all();
             slot.ready.notify_all();
         };
+        std::atomic<std::uint64_t> producerAliveMs{ GetTickCount64() };
 
         std::chrono::nanoseconds captureTime{};
         std::chrono::nanoseconds encodingTime{};
         std::chrono::nanoseconds sendTime{};
-        std::chrono::nanoseconds maximumProducerWork{};
         std::chrono::nanoseconds maximumConsumerWork{};
-        std::chrono::nanoseconds maximumOutputInterval{};
-        std::uint64_t delayedOutputIntervals{};
-        Clock::time_point previousFrameFinished{};
+        std::uint64_t frameAgeTotalUs{};
+        std::uint64_t maximumFrameAgeUs{};
+        std::uint64_t agedFrames{};
+        std::uint64_t newFrames{};
 
         std::thread producer([&]
         {
@@ -1464,8 +1500,11 @@ namespace
             {
                 auto prepared = std::move(frame);
                 auto preparedShared = initialSharedFrame;
-                auto nextCaptureTime = streamStarted;
-                for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+                unsigned refinementsLeft = kRefinementFrames;
+                auto lastSubmitted = streamStarted;
+                auto nextOrientationCheck = streamStarted + std::chrono::seconds(1);
+                // The first slot carries the frame captured while the stream was set up.
+                for (bool firstFrame = true;; firstFrame = false)
                 {
                     {
                         std::unique_lock lock(slot.mutex);
@@ -1473,27 +1512,30 @@ namespace
                         if (slot.stop) return;
                     }
 
-                    if (frameIndex != 0)
+                    bool newFrame = firstFrame;
+                    while (!newFrame)
                     {
-                        nextCaptureTime += frameDuration;
-                        std::this_thread::sleep_until(nextCaptureTime);
-                    }
-                    if (frameIndex != 0 && frameIndex % fps == 0 &&
-                        TabletDisplayOrientation() != orientation)
-                    {
-                        throw std::runtime_error(
-                            "The virtual display orientation changed; reconnecting the stream");
-                    }
+                        producerAliveMs = GetTickCount64();
+                        {
+                            std::lock_guard lock(slot.mutex);
+                            if (slot.stop) return;
+                        }
+                        const auto now = Clock::now();
+                        if (now >= nextOrientationCheck)
+                        {
+                            if (TabletDisplayOrientation() != orientation)
+                            {
+                                throw std::runtime_error(
+                                    "The virtual display orientation changed; reconnecting the stream");
+                            }
+                            nextOrientationCheck = now + std::chrono::seconds(1);
+                        }
 
-                    const auto producerWorkStarted = Clock::now();
-                    bool newSharedFrame = sharedTransport;
-                    if (frameIndex != 0)
-                    {
                         const auto captureStarted = Clock::now();
                         if (sharedTransport)
                         {
-                            newSharedFrame = capture.CaptureShared(preparedShared, 0);
-                            if (newSharedFrame &&
+                            newFrame = capture.CaptureShared(preparedShared, 0);
+                            if (newFrame &&
                                 (preparedShared.width != rawWidth ||
                                  preparedShared.height != rawHeight))
                             {
@@ -1503,25 +1545,36 @@ namespace
                         }
                         else if (capture.Capture(prepared, 0))
                         {
+                            newFrame = true;
                             if (prepared.width != rawWidth || prepared.height != rawHeight)
                             {
                                 throw std::runtime_error(
                                     "The virtual display mode changed during streaming; restart virtual-stream.cmd");
                             }
                         }
-                        captureTime += Clock::now() - captureStarted;
+                        if (newFrame)
+                        {
+                            captureTime += Clock::now() - captureStarted;
+                            break;
+                        }
+                        // A keyframe request is answered even while the picture is static.
+                        if (forceKeyFrame.load()) break;
+                        if (refinementsLeft > 0 && now - lastSubmitted >= frameDuration) break;
+                        std::this_thread::sleep_for(kCapturePollInterval);
                     }
-                    maximumProducerWork = std::max(
-                        maximumProducerWork,
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            Clock::now() - producerWorkStarted));
+                    if (newFrame)
+                        refinementsLeft = kRefinementFrames;
+                    else if (refinementsLeft > 0)
+                        --refinementsLeft;
+                    lastSubmitted = Clock::now();
 
                     {
                         std::lock_guard lock(slot.mutex);
                         if (slot.stop) return;
                         slot.frame = prepared;
                         slot.sharedFrame = preparedShared;
-                        slot.newSharedFrame = newSharedFrame;
+                        slot.newFrame = newFrame;
+                        slot.newSharedFrame = sharedTransport && newFrame;
                         slot.occupied = true;
                     }
                     slot.ready.notify_one();
@@ -1542,24 +1595,21 @@ namespace
 
         tabletdisplay::host::CapturedFrame bgraFrame;
         tabletdisplay::host::SharedCapturedFrame sharedFrame;
+        bool newFrame{};
         bool newSharedFrame{};
         auto activeSharedGeneration = initialSharedFrame.generation;
         std::uint64_t submittedFrames{};
+        std::uint64_t lastPtsUs{};
         bool conversionReported{};
-        bool stopped{};
         const auto pingToken = RandomNonce();
         auto lastPingSent = Clock::now();
         lastReceivedMs = GetTickCount64();
         try
         {
-            for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+            for (;;)
             {
                 checkReceiver();
-                if (StopRequested())
-                {
-                    stopped = true;
-                    break;
-                }
+                if (StopRequested() || Clock::now() >= streamDeadline) break;
                 // Heartbeat: Android answers each PING with PONG, so silence means it is gone.
                 if (Clock::now() - lastPingSent >= std::chrono::milliseconds(kHeartbeatIntervalMs))
                 {
@@ -1568,26 +1618,51 @@ namespace
                 }
                 if (GetTickCount64() - lastReceivedMs.load() > kIdleTimeoutMs)
                     throw ProtocolFailure(kErrorTimeout, "Android did not answer the heartbeat");
+                // A static picture sends no frames, so the watchdog is fed while both the tablet
+                // and the producer (which polls the driver every millisecond) are alive.
+                if (GetTickCount64() - producerAliveMs.load() < 5'000U) ReportProgress();
 
                 {
                     std::unique_lock lock(slot.mutex);
-                    slot.ready.wait(lock, [&]
+                    // Wakes periodically so the heartbeat runs while the picture is static.
+                    slot.ready.wait_for(lock, std::chrono::milliseconds(50), [&]
                     {
                         return slot.occupied || slot.finished || slot.failure;
                     });
                     if (slot.failure) std::rethrow_exception(slot.failure);
-                    if (!slot.occupied) break;
+                    if (!slot.occupied)
+                    {
+                        if (slot.finished)
+                            throw std::runtime_error("The frame preparation pipeline stopped unexpectedly");
+                        continue;
+                    }
                     bgraFrame = slot.frame;
                     sharedFrame = slot.sharedFrame;
+                    newFrame = slot.newFrame;
                     newSharedFrame = slot.newSharedFrame;
                 }
 
-                const auto consumerWorkStarted = Clock::now();
-                const auto ptsUs = frameIndex * 1'000'000ULL / fps;
                 const auto encodingStarted = Clock::now();
+                if (newSharedFrame && sharedFrame.timestampUs != 0)
+                {
+                    const auto nowUs = QpcMicroseconds();
+                    if (nowUs > sharedFrame.timestampUs)
+                    {
+                        const auto ageUs = nowUs - sharedFrame.timestampUs;
+                        frameAgeTotalUs += ageUs;
+                        maximumFrameAgeUs = std::max(maximumFrameAgeUs, ageUs);
+                        ++agedFrames;
+                    }
+                }
+                // Frames follow the picture changes, so PTS is wall-clock time, kept increasing.
+                const auto ptsUs = std::max<std::uint64_t>(
+                    lastPtsUs + 1U,
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                        encodingStarted - streamStarted).count()));
+                lastPtsUs = ptsUs;
                 const auto keyFrameRequested = forceKeyFrame.exchange(false);
                 if (keyFrameRequested) writer.RequestDiscontinuity();
-                const auto requestKeyFrame = frameIndex == 0 || keyFrameRequested;
+                const auto requestKeyFrame = submittedFrames == 0 || keyFrameRequested;
                 if (sharedTransport && newSharedFrame &&
                     sharedFrame.generation != activeSharedGeneration)
                 {
@@ -1635,21 +1710,10 @@ namespace
                     writer.Send(encoded);
                 sendTime += Clock::now() - sendStarted;
                 ++submittedFrames;
-
-                const auto frameFinished = Clock::now();
+                if (newFrame) ++newFrames;
                 maximumConsumerWork = std::max(
                     maximumConsumerWork,
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        frameFinished - consumerWorkStarted));
-                if (frameIndex != 0)
-                {
-                    const auto outputInterval = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        frameFinished - previousFrameFinished);
-                    maximumOutputInterval = std::max(maximumOutputInterval, outputInterval);
-                    if (outputInterval > frameDuration + std::chrono::milliseconds(2))
-                        ++delayedOutputIntervals;
-                }
-                previousFrameFinished = frameFinished;
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - encodingStarted));
             }
             stopProducer();
             producer.join();
@@ -1661,12 +1725,10 @@ namespace
             if (producer.joinable()) producer.join();
             throw;
         }
-        if (!stopped && submittedFrames != frameCount)
-            throw std::runtime_error("The frame preparation pipeline stopped before completing the stream");
 
         const auto streamElapsed = Clock::now() - streamStarted;
         for (const auto& encoded : encoder.Drain()) writer.Send(encoded);
-        writer.SendEndOfStream(submittedFrames * 1'000'000ULL / fps);
+        writer.SendEndOfStream(lastPtsUs + 1U);
         receiver.request_stop();
         receiver.join();
         checkReceiver();
@@ -1680,19 +1742,18 @@ namespace
         };
         std::cout
             << "Pipeline timing: "
-            << std::chrono::duration<double>(streamElapsed).count() << " s loop, avg/frame "
+            << std::chrono::duration<double>(streamElapsed).count() << " s loop, "
+            << submittedFrames << " frames (" << newFrames << " new, "
+            << submittedFrames - newFrames << " refinement/keyframe repeats); avg/frame "
             << averageMilliseconds(captureTime) << " ms capture, "
             << averageMilliseconds(encodingTime) << " ms "
             << (encoder.UsesGpuBgraConversion() ? "GPU" : "CPU fallback")
             << " convert/encode, "
-            << averageMilliseconds(sendTime) << " ms send; max producer "
-            << std::chrono::duration<double, std::milli>(maximumProducerWork).count()
-            << " ms, max encode/send "
+            << averageMilliseconds(sendTime) << " ms send; max encode/send "
             << std::chrono::duration<double, std::milli>(maximumConsumerWork).count()
-            << " ms; max output interval "
-            << std::chrono::duration<double, std::milli>(maximumOutputInterval).count()
-            << " ms, delayed intervals " << delayedOutputIntervals << '/'
-            << (submittedFrames > 0 ? submittedFrames - 1 : 0) << ".\n";
+            << " ms; driver frame age at encode avg "
+            << (agedFrames > 0 ? static_cast<double>(frameAgeTotalUs) / agedFrames / 1'000.0 : 0.0)
+            << " ms, max " << static_cast<double>(maximumFrameAgeUs) / 1'000.0 << " ms.\n";
     }
 
     void PrintHelp()
@@ -1861,6 +1922,7 @@ int main(int argc, char* argv[])
 {
     try
     {
+        UseHighResolutionTimer();
         const std::string_view command = argc > 1 ? argv[1] : "--check";
         if (command == "--help")
         {
