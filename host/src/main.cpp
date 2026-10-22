@@ -2079,7 +2079,7 @@ int main(int argc, char* argv[])
         }
         if (command == "--version")
         {
-            std::cout << "TabletDisplayHost 0.1.5\n";
+            std::cout << "TabletDisplayHost 0.2.0\n";
             return 0;
         }
         if (command == "--check")
