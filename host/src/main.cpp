@@ -14,6 +14,8 @@
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
 #include "video/VideoProcessing.h"
+#include "wifi/WifiClient.h"
+#include "wifi/WifiDiscovery.h"
 
 #include <algorithm>
 #include <array>
@@ -124,6 +126,10 @@ namespace
     // --ignore-decoder-limit streams the chosen resolution even beyond the decoder limits the
     // tablet reports; many decoders play more than they declare.
     bool g_ignoreDecoderLimit{};
+    // --wifi-tablet: the paired tablet (32 hex digits) streamed over Wi-Fi instead of adb;
+    // --wifi-address overrides the address remembered from discovery.
+    std::wstring g_wifiTablet;
+    std::wstring g_wifiAddress;
     std::atomic<std::uint64_t> g_lastProgressMs{ GetTickCount64() };
 
     [[nodiscard]] bool StopRequested() noexcept
@@ -703,24 +709,6 @@ namespace
         throw std::runtime_error("Cannot connect to Android on 127.0.0.1:" + std::to_string(localPort));
     }
 
-    void SendAll(SOCKET socket, std::span<const std::uint8_t> bytes)
-    {
-        std::size_t offset{};
-        while (offset < bytes.size())
-        {
-            const auto remaining = std::min<std::size_t>(
-                bytes.size() - offset,
-                static_cast<std::size_t>(std::numeric_limits<int>::max()));
-            const auto sent = send(
-                socket,
-                reinterpret_cast<const char*>(bytes.data() + offset),
-                static_cast<int>(remaining),
-                0);
-            if (sent == SOCKET_ERROR || sent == 0) throw TransportFailure("TCP send failed");
-            offset += static_cast<std::size_t>(sent);
-        }
-    }
-
     [[nodiscard]] Message MakeMessage(
         MessageType type,
         std::uint64_t sequence,
@@ -851,9 +839,33 @@ namespace
         return MakeMessage(MessageType::VideoFrame, sequence, std::move(payload), flags);
     }
 
-    void SendMessage(SOCKET socket, const Message& message)
+    void SendMessage(tabletdisplay::wifi::ByteStream& stream, const Message& message)
     {
-        SendAll(socket, EncodeMessage(message.header, message.payload));
+        try
+        {
+            stream.Send(EncodeMessage(message.header, message.payload));
+        }
+        catch (const TransportFailure&)
+        {
+            throw;
+        }
+        catch (const std::runtime_error& exception)
+        {
+            throw TransportFailure(exception.what());
+        }
+    }
+
+    // Receive with the transport's conventions mapped to Host failures; -1 means timeout.
+    [[nodiscard]] int ReceiveSome(tabletdisplay::wifi::ByteStream& stream, std::span<std::uint8_t> buffer)
+    {
+        try
+        {
+            return stream.Receive(buffer);
+        }
+        catch (const std::runtime_error& exception)
+        {
+            throw TransportFailure(exception.what());
+        }
     }
 
     // Serializes Windows-to-Android messages from the streaming and receiving threads and
@@ -861,8 +873,8 @@ namespace
     class ProtocolSender
     {
     public:
-        ProtocolSender(SOCKET socket, std::uint64_t nextSequence) noexcept
-            : m_socket(socket), m_nextSequence(nextSequence)
+        ProtocolSender(tabletdisplay::wifi::ByteStream& stream, std::uint64_t nextSequence) noexcept
+            : m_stream(stream), m_nextSequence(nextSequence)
         {
         }
 
@@ -870,11 +882,11 @@ namespace
         void Send(MakeMessageForSequence&& make)
         {
             std::lock_guard lock(m_mutex);
-            SendMessage(m_socket, make(m_nextSequence++));
+            SendMessage(m_stream, make(m_nextSequence++));
         }
 
     private:
-        SOCKET m_socket;
+        tabletdisplay::wifi::ByteStream& m_stream;
         std::mutex m_mutex;
         std::uint64_t m_nextSequence;
     };
@@ -947,10 +959,10 @@ namespace
         AndroidDisplay display;
     };
 
-    [[nodiscard]] HandshakeResult PerformHandshake(SOCKET socket)
+    [[nodiscard]] HandshakeResult PerformHandshake(tabletdisplay::wifi::ByteStream& stream)
     {
         const auto nonce = RandomNonce();
-        SendMessage(socket, MakeHello(nonce));
+        SendMessage(stream, MakeHello(nonce));
         IncrementalDecoder decoder;
         std::array<std::uint8_t, 16 * 1024> buffer{};
         bool ackReceived{};
@@ -961,10 +973,9 @@ namespace
 
         while (true)
         {
-            const auto count = recv(socket, reinterpret_cast<char*>(buffer.data()),
-                static_cast<int>(buffer.size()), 0);
+            const auto count = ReceiveSome(stream, buffer);
             if (count == 0) throw TransportFailure("Android closed the handshake connection");
-            if (count == SOCKET_ERROR) throw TransportFailure("TCP receive timed out or failed");
+            if (count < 0) throw TransportFailure("Android did not answer the handshake in time");
             for (const auto& message : decoder.Feed(
                 std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(count))))
             {
@@ -1016,7 +1027,7 @@ namespace
             }
             if (ackReceived && displayReceived && !pingSent)
             {
-                SendMessage(socket, MakePing(2, pingToken));
+                SendMessage(stream, MakePing(2, pingToken));
                 pingSent = true;
             }
         }
@@ -1269,6 +1280,7 @@ namespace
     // monitor 0 leases the first free driver monitor, N (1..4) leases monitor N.
     void RunVirtualDisplayStream(
         SOCKET socket,
+        tabletdisplay::wifi::ByteStream& stream,
         ProtocolSender& sender,
         IncrementalDecoder receiveDecoder,
         const AndroidDisplay& display,
@@ -1420,14 +1432,17 @@ namespace
                 std::array<std::uint8_t, 16 * 1024> buffer{};
                 while (!stopToken.stop_requested())
                 {
-                    const auto count = recv(socket, reinterpret_cast<char*>(buffer.data()),
-                        static_cast<int>(buffer.size()), 0);
-                    if (count == SOCKET_ERROR)
+                    int count{};
+                    try
                     {
-                        if (WSAGetLastError() == WSAETIMEDOUT) continue;
-                        if (stopToken.stop_requested()) return;
-                        throw TransportFailure("Android-to-Windows receive failed");
+                        count = ReceiveSome(stream, buffer);
                     }
+                    catch (const TransportFailure&)
+                    {
+                        if (stopToken.stop_requested()) return;
+                        throw;
+                    }
+                    if (count < 0) continue;
                     if (count == 0)
                     {
                         if (stopToken.stop_requested()) return;
@@ -1833,6 +1848,7 @@ namespace
             << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N] [--reconnect]\n"
             << "                    [--scale 1|2|3|4] [--fps 60|30] [--ignore-decoder-limit]\n"
             << "                    [--monitor 1|2|3|4] [--port PORT] [--stop-event NAME]\n"
+            << "                    [--wifi-tablet ID [--wifi-address HOST]]\n"
             << "  TabletDisplayHost --version\n"
             << "--seconds 0 streams the virtual display until the stop event is signaled.\n"
             << "--scale N divides the tablet resolution by N, keeping its aspect ratio (default 1).\n"
@@ -1840,7 +1856,88 @@ namespace
             << "--ignore-decoder-limit streams the chosen resolution beyond the decoder limits the tablet reports.\n"
             << "--monitor N streams TabletDisplay monitor N (default: the first free one), so several\n"
             << "  tablets can run one Host each; every Host needs its own --serial and --port.\n"
-            << "--port PORT is the local adb forward port (default " << kPort << ").\n";
+            << "--port PORT is the local adb forward port (default " << kPort << ").\n"
+            << "--wifi-tablet ID streams to a tablet paired over Wi-Fi instead of using adb.\n";
+    }
+
+    // Runs protocol v1 over an established USB (adb) or Wi-Fi stream.
+    void RunProtocolSession(
+        SOCKET socket,
+        tabletdisplay::wifi::ByteStream& stream,
+        const std::string& deviceKey,
+        RunMode mode,
+        unsigned streamSeconds,
+        unsigned resolutionDivisor,
+        unsigned monitor)
+    {
+        auto handshake = PerformHandshake(stream);
+        ProtocolSender sender(stream, handshake.nextSequence);
+        try
+        {
+            if (mode == RunMode::Synthetic)
+            {
+                RunSyntheticDemo(sender);
+            }
+            else if (mode == RunMode::EncoderDemo)
+            {
+                RunEncoderDemo(sender, streamSeconds);
+            }
+            else if (mode == RunMode::Desktop)
+            {
+                RunDesktopStream(sender, streamSeconds);
+            }
+            else if (mode == RunMode::VirtualDisplay)
+            {
+                RunVirtualDisplayStream(
+                    socket,
+                    stream,
+                    sender,
+                    std::move(handshake.decoder),
+                    handshake.display,
+                    deviceKey,
+                    resolutionDivisor,
+                    monitor,
+                    streamSeconds);
+            }
+        }
+        catch (...)
+        {
+            SendFatalError(sender, std::current_exception());
+            throw;
+        }
+    }
+
+    // Wi-Fi without adb (doc/PROTOCOL.md section 10): the tablet must be paired from the tray.
+    void ConnectWifi(RunMode mode, unsigned streamSeconds, unsigned resolutionDivisor, unsigned monitor)
+    {
+        namespace wifi = tabletdisplay::wifi;
+        const auto id = wifi::FromHex(g_wifiTablet);
+        if (!id || id->size() != wifi::kIdSize) throw std::runtime_error("--wifi-tablet must be 32 hex digits");
+        const auto tablet = wifi::LoadPairing(*id);
+        if (!tablet) throw std::runtime_error("This tablet is not paired; pair it from the tray menu");
+        const auto address = g_wifiAddress.empty() ? tablet->address : g_wifiAddress;
+        if (address.empty()) throw NoDeviceFailure("The tablet's Wi-Fi address is not known yet");
+
+        WinsockSession winsock;
+        SocketHandle socket;
+        try
+        {
+            socket.reset(wifi::ConnectTcp(address, tablet->port, 3'000));
+        }
+        catch (const std::runtime_error& exception)
+        {
+            // Out of range or switched off: wait like for an unplugged USB tablet.
+            throw NoDeviceFailure(exception.what());
+        }
+        const DWORD timeout = 5'000;
+        setsockopt(socket.get(), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        setsockopt(socket.get(), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        auto stream = wifi::OpenSession(socket.get(), wifi::WindowsId(), *tablet);
+        std::cout << "Wi-Fi tablet: " << Narrow(tablet->name) << " at " << Narrow(address) << '\n';
+        if (!g_wifiAddress.empty() && g_wifiAddress != tablet->address)
+            wifi::SaveTabletAddress(*id, g_wifiAddress, tablet->port);
+        RunProtocolSession(
+            socket.get(), *stream, "wifi-" + Narrow(g_wifiTablet), mode, streamSeconds, resolutionDivisor, monitor);
     }
 
     int ConnectCommand(
@@ -1851,6 +1948,11 @@ namespace
         unsigned monitor = 0,
         std::uint16_t localPort = kPort)
     {
+        if (!g_wifiTablet.empty())
+        {
+            ConnectWifi(mode, streamSeconds, resolutionDivisor, monitor);
+            return 0;
+        }
         const auto adb = FindAdb();
         std::cout << "ADB: " << Narrow(adb.wstring()) << '\n';
         const auto deviceResult = RunProcess(adb, L"devices -l");
@@ -1875,40 +1977,8 @@ namespace
             }
             WinsockSession winsock;
             auto socket = ConnectLoopback(localPort);
-            auto handshake = PerformHandshake(socket.get());
-            ProtocolSender sender(socket.get(), handshake.nextSequence);
-            try
-            {
-                if (mode == RunMode::Synthetic)
-                {
-                    RunSyntheticDemo(sender);
-                }
-                else if (mode == RunMode::EncoderDemo)
-                {
-                    RunEncoderDemo(sender, streamSeconds);
-                }
-                else if (mode == RunMode::Desktop)
-                {
-                    RunDesktopStream(sender, streamSeconds);
-                }
-                else if (mode == RunMode::VirtualDisplay)
-                {
-                    RunVirtualDisplayStream(
-                        socket.get(),
-                        sender,
-                        std::move(handshake.decoder),
-                        handshake.display,
-                        serial,
-                        resolutionDivisor,
-                        monitor,
-                        streamSeconds);
-                }
-            }
-            catch (...)
-            {
-                SendFatalError(sender, std::current_exception());
-                throw;
-            }
+            tabletdisplay::wifi::PlainStream stream(socket.get());
+            RunProtocolSession(socket.get(), stream, serial, mode, streamSeconds, resolutionDivisor, monitor);
             if (createdForward)
             {
                 const auto result = RunProcess(adb, selector + L"forward --remove " + localEndpoint);
@@ -2020,6 +2090,51 @@ int main(int argc, char* argv[])
                 << "ADB: " << Narrow(FindAdb().wstring()) << '\n';
             return 0;
         }
+        if (command == "--wifi-discover")
+        {
+            namespace wifi = tabletdisplay::wifi;
+            WinsockSession winsock;
+            const auto paired = wifi::LoadPairings();
+            const auto tablets = wifi::DiscoverTablets(3'000);
+            if (tablets.empty()) std::cout << "No TabletDisplay app found on the local network.\n";
+            for (const auto& tablet : tablets)
+            {
+                const bool isPaired = std::ranges::any_of(paired, [&](const wifi::PairedTablet& known)
+                {
+                    return wifi::ToHex(known.id) == tablet.id;
+                });
+                std::cout << Narrow(tablet.name) << "  id " << Narrow(tablet.id) << "  "
+                    << Narrow(tablet.address) << ':' << tablet.port << (isPaired ? "  paired" : "  not paired") << '\n';
+            }
+            return 0;
+        }
+        if (command == "--wifi-pair" && argc >= 3)
+        {
+            namespace wifi = tabletdisplay::wifi;
+            WinsockSession winsock;
+            const auto address = Widen(argv[2]);
+            const auto port = argc >= 4 ? static_cast<std::uint16_t>(std::stoul(argv[3])) : wifi::kWifiPort;
+            SocketHandle socket(wifi::ConnectTcp(address, port, 3'000));
+            auto tablet = wifi::Pair(socket.get(), wifi::WindowsId(), wifi::WindowsName(),
+                [](const std::string& code, const std::wstring& tabletName)
+                {
+                    std::cout << "Tablet " << Narrow(tabletName) << " shows code " << code.substr(0, 3) << ' '
+                        << code.substr(3) << "? Confirm on the tablet too. Matches [y/N]: " << std::flush;
+                    std::string answer;
+                    std::getline(std::cin, answer);
+                    return answer == "y" || answer == "Y";
+                });
+            if (!tablet)
+            {
+                std::cout << "Pairing was rejected.\n";
+                return 1;
+            }
+            tablet->address = address;
+            tablet->port = port;
+            wifi::SavePairing(*tablet);
+            std::cout << "Paired " << Narrow(tablet->name) << ", id " << Narrow(wifi::ToHex(tablet->id)) << ".\n";
+            return 0;
+        }
         if (command == "--connect" || command == "--demo" ||
             command == "--encoder-demo" || command == "--stream" ||
             command == "--virtual-stream")
@@ -2074,6 +2189,14 @@ int main(int argc, char* argv[])
                     const auto parsed = std::stoul(argv[++index]);
                     if (parsed != 60 && parsed != 30) throw std::runtime_error("--fps must be 60 or 30");
                     g_streamFps = static_cast<std::uint16_t>(parsed);
+                }
+                else if (option == "--wifi-tablet" && index + 1 < argc)
+                {
+                    g_wifiTablet = Widen(argv[++index]);
+                }
+                else if (option == "--wifi-address" && index + 1 < argc)
+                {
+                    g_wifiAddress = Widen(argv[++index]);
                 }
                 else if (option == "--ignore-decoder-limit" && command == "--virtual-stream")
                 {

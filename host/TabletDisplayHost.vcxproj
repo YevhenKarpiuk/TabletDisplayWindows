@@ -53,7 +53,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>ws2_32.lib;winmm.lib;d3d11.lib;dxgi.lib;setupapi.lib;mfplat.lib;mf.lib;mfuuid.lib;ole32.lib;propsys.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>ws2_32.lib;winmm.lib;bcrypt.lib;crypt32.lib;d3d11.lib;dxgi.lib;setupapi.lib;mfplat.lib;mf.lib;mfuuid.lib;ole32.lib;propsys.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -65,6 +65,10 @@
     <ClCompile Include="..\shared\protocol\Protocol.cpp" />
     <ClCompile Include="..\shared\video\SyntheticH264.cpp" />
     <ClCompile Include="..\shared\video\VideoProcessing.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiClient.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiCrypto.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiDiscovery.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiPairings.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\DesktopCapture.h" />

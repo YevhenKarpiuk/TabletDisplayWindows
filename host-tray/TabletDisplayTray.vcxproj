@@ -53,11 +53,15 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>shell32.lib;user32.lib;wtsapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>shell32.lib;user32.lib;wtsapi32.lib;ws2_32.lib;dnsapi.lib;bcrypt.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiClient.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiCrypto.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiDiscovery.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiPairings.cpp" />
     <ResourceCompile Include="TabletDisplayTray.rc" />
   </ItemGroup>
   <ItemGroup>

@@ -1,5 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <winsock2.h>
 #include <windows.h>
 #include <dbt.h>
 #include <shellapi.h>
@@ -7,9 +8,12 @@
 
 #include "../resource.h"
 #include "display/DisplayModes.h"
+#include "wifi/WifiClient.h"
+#include "wifi/WifiDiscovery.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -17,6 +21,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stop_token>
 #include <string>
@@ -30,6 +35,16 @@ namespace
     // wParam: bit mask of the monitors whose Hosts stopped; lParam: the stop worker id.
     constexpr UINT kHostsStoppedMessage = WM_APP + 3;
     constexpr UINT kExitCommand = 1001;
+    // kPairCommandBase + N pairs the N-th unpaired Wi-Fi tablet found on the network;
+    // kForgetCommandBase + N forgets the N-th paired one.
+    constexpr UINT kPairCommandBase = 1200;
+    constexpr UINT kForgetCommandBase = 1300;
+    constexpr UINT kMaxWifiMenuItems = 16;
+    constexpr UINT kPairingFinishedMessage = WM_APP + 4;
+    constexpr DWORD kWifiPollMs = 5'000;
+    // A Wi-Fi tablet missed by a few discovery rounds still counts as present.
+    constexpr ULONGLONG kWifiPresenceMs = 20'000;
+    constexpr wchar_t kWifiSerialPrefix[] = L"wifi-";
     constexpr UINT kAutoStartCommand = 1002;
     // kResolutionCommandBase + 10 * monitor index + N selects that tablet's resolution
     // divided by N (1..4).
@@ -59,11 +74,19 @@ namespace
         0x2b84c20e, 0xad23, 0x4ddf, { 0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5 }
     };
 
+    // A tablet the tray can stream to: an adb serial, or "wifi-<id>" for a paired Wi-Fi tablet.
     struct AdbDevice
     {
         std::wstring serial;
         std::wstring model;
         bool ready{};
+        std::wstring address;
+    };
+
+    struct SeenWifiTablet
+    {
+        tabletdisplay::wifi::DiscoveredTablet tablet;
+        ULONGLONG lastSeen{};
     };
 
     // The Host streaming one TabletDisplay monitor; serial is empty while the monitor is free.
@@ -75,6 +98,7 @@ namespace
         PROCESS_INFORMATION process{};
         HANDLE stopEvent{};
         std::wstring stopEventName;
+        std::wstring address;
         bool stopping{};
     };
 
@@ -89,6 +113,13 @@ namespace
     std::mutex g_devicesMutex;
     std::vector<AdbDevice> g_devices;
     std::jthread g_deviceWatcher;
+    std::jthread g_wifiWatcher;
+    std::jthread g_pairingWorker;
+    std::atomic_bool g_pairingActive{};
+    std::map<std::wstring, SeenWifiTablet> g_wifiTablets;
+    // Snapshots behind the Wi-Fi menu items of the last opened tray menu.
+    std::vector<tabletdisplay::wifi::DiscoveredTablet> g_pairCandidates;
+    std::vector<tabletdisplay::wifi::PairedTablet> g_forgetCandidates;
     // Workers that wait for stopping Hosts, keyed by the id they post back to the window.
     std::map<LPARAM, std::jthread> g_stopWorkers;
     LPARAM g_nextStopWorker{};
@@ -314,8 +345,8 @@ namespace
         return {};
     }
 
-    // Runs "adb devices" and returns its output, or nothing when adb fails or hangs.
-    std::optional<std::string> AdbDevicesOutput(const std::filesystem::path& adb)
+    // Runs adb with the arguments and returns its output, or nothing when adb fails or hangs.
+    std::optional<std::string> AdbOutput(const std::filesystem::path& adb, const std::wstring& arguments)
     {
         SECURITY_ATTRIBUTES security{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
         HANDLE readPipe{};
@@ -333,7 +364,7 @@ namespace
         startup.hStdOutput = writePipe;
         startup.hStdError = writePipe;
         PROCESS_INFORMATION process{};
-        auto command = L"\"" + adb.wstring() + L"\" devices -l";
+        auto command = L"\"" + adb.wstring() + L"\" " + arguments;
         const auto created = CreateProcessW(
             adb.c_str(), command.data(), nullptr, nullptr, TRUE,
             CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
@@ -417,19 +448,101 @@ namespace
         std::mutex mutex;
         std::condition_variable_any wake;
         std::unique_lock lock(mutex);
+        // Wi-Fi address of each USB tablet, refreshed every 30 s: a tablet that is both plugged in
+        // and found on the network streams over USB only.
+        std::map<std::wstring, std::pair<std::wstring, ULONGLONG>> wifiAddresses;
         do
         {
             const auto adb = FindAdb();
-            const auto output = adb.empty() ? std::nullopt : AdbDevicesOutput(adb);
+            const auto output = adb.empty() ? std::nullopt : AdbOutput(adb, L"devices -l");
             if (output)
             {
+                auto devices = ParseAdbDevices(*output);
+                const auto now = GetTickCount64();
+                for (auto& device : devices)
+                {
+                    if (!device.ready) continue;
+                    auto& cached = wifiAddresses[device.serial];
+                    if (cached.second == 0 || now - cached.second > 30'000)
+                    {
+                        cached = { {}, now };
+                        const auto ip = AdbOutput(adb, L"-s \"" + device.serial + L"\" shell ip -4 addr show wlan0");
+                        const auto inet = ip ? ip->find("inet ") : std::string::npos;
+                        if (inet != std::string::npos)
+                        {
+                            const auto start = inet + 5;
+                            const auto end = ip->find_first_of("/ \r\n", start);
+                            const auto text = ip->substr(start, end == std::string::npos ? std::string::npos : end - start);
+                            cached.first.assign(text.begin(), text.end());
+                        }
+                    }
+                    device.address = cached.first;
+                }
                 {
                     std::lock_guard devicesLock(g_devicesMutex);
-                    g_devices = ParseAdbDevices(*output);
+                    g_devices = std::move(devices);
                 }
                 (void)PostMessageW(window, kDevicesMessage, 0, 0);
             }
         } while (!wake.wait_for(lock, stopToken, std::chrono::milliseconds(kDevicePollMs), [] { return false; }));
+    }
+
+    // Browses the network for TabletDisplay apps (DNS-SD) and posts the result to the window.
+    void WatchWifiTablets(std::stop_token stopToken, HWND window)
+    {
+        std::mutex mutex;
+        std::condition_variable_any wake;
+        std::unique_lock lock(mutex);
+        do
+        {
+            const auto found = tabletdisplay::wifi::DiscoverTablets(1'500);
+            const auto now = GetTickCount64();
+            {
+                std::lock_guard devicesLock(g_devicesMutex);
+                for (const auto& tablet : found) g_wifiTablets[tablet.id] = { tablet, now };
+                std::erase_if(g_wifiTablets, [now](const auto& entry)
+                {
+                    return now - entry.second.lastSeen > kWifiPresenceMs;
+                });
+            }
+            (void)PostMessageW(window, kDevicesMessage, 0, 0);
+        } while (!wake.wait_for(lock, stopToken, std::chrono::milliseconds(kWifiPollMs), [] { return false; }));
+    }
+
+    bool IsWifiSerial(const std::wstring& serial)
+    {
+        return serial.starts_with(kWifiSerialPrefix);
+    }
+
+    // USB tablets from adb plus the paired tablets currently found on the network.
+    std::vector<AdbDevice> CombinedDevices()
+    {
+        std::vector<AdbDevice> devices;
+        std::vector<SeenWifiTablet> wifiTablets;
+        {
+            std::lock_guard lock(g_devicesMutex);
+            devices = g_devices;
+            for (const auto& [id, seen] : g_wifiTablets) wifiTablets.push_back(seen);
+        }
+        std::set<std::wstring> paired;
+        for (const auto& tablet : tabletdisplay::wifi::LoadPairings())
+            paired.insert(tabletdisplay::wifi::ToHex(tablet.id));
+        // A tablet plugged in over USB is streamed over USB, not a second time over Wi-Fi.
+        std::set<std::wstring> usbAddresses;
+        for (const auto& device : devices)
+        {
+            if (device.ready && !device.address.empty()) usbAddresses.insert(device.address);
+        }
+        for (const auto& seen : wifiTablets)
+        {
+            if (!paired.contains(seen.tablet.id) || usbAddresses.contains(seen.tablet.address)) continue;
+            devices.push_back({
+                kWifiSerialPrefix + seen.tablet.id,
+                seen.tablet.name + L" (Wi-Fi)",
+                true,
+                seen.tablet.address });
+        }
+        return devices;
     }
 
     // Each tablet keeps the monitor it got first, so Windows restores its display position.
@@ -627,7 +740,7 @@ namespace
         }
     }
 
-    bool StartHost(HWND owner, DWORD monitor, const std::wstring& serial)
+    bool StartHost(HWND owner, DWORD monitor, const std::wstring& serial, const std::wstring& address)
     {
         auto& host = g_hosts[monitor - 1];
         CloseHostHandles(host);
@@ -661,11 +774,14 @@ namespace
         }
         (void)ResetEvent(host.stopEvent);
 
-        // Every tablet gets its own Host, monitor and local adb forward port.
+        // Every tablet gets its own Host and monitor; USB tablets also their own adb forward port.
+        const auto transport = IsWifiSerial(serial)
+            ? L" --wifi-tablet " + serial.substr(wcslen(kWifiSerialPrefix)) +
+                (address.empty() ? std::wstring() : L" --wifi-address " + address)
+            : L" --serial \"" + serial + L"\" --port " + std::to_wstring(kBasePort + monitor - 1);
         std::wstring command = L"\"" + hostPath.wstring() +
-            L"\" --virtual-stream --reconnect --seconds 0 --serial \"" + serial +
-            L"\" --monitor " + std::to_wstring(monitor) +
-            L" --port " + std::to_wstring(kBasePort + monitor - 1) +
+            L"\" --virtual-stream --reconnect --seconds 0" + transport +
+            L" --monitor " + std::to_wstring(monitor) +
             L" --scale " + std::to_wstring(DeviceResolutionDivisor(serial)) +
             L" --fps " + std::to_wstring(DeviceFps(serial)) +
             (DeviceIgnoresDecoderLimit(serial) ? L" --ignore-decoder-limit" : L"") +
@@ -693,6 +809,7 @@ namespace
         CloseHandle(host.process.hThread);
         host.process.hThread = nullptr;
         host.serial = serial;
+        host.address = address;
         return true;
     }
 
@@ -703,11 +820,7 @@ namespace
     void ReconcileHosts(HWND window)
     {
         if (g_exiting || !g_displayPoweredOn || g_sessionLocked) return;
-        std::vector<AdbDevice> devices;
-        {
-            std::lock_guard lock(g_devicesMutex);
-            devices = g_devices;
-        }
+        const auto devices = CombinedDevices();
         const auto find = [&](const std::wstring& serial)
         {
             return std::find_if(devices.begin(), devices.end(), [&](const AdbDevice& device)
@@ -735,7 +848,8 @@ namespace
             if (host.serial.empty() || host.stopping || IsHostRunning(host)) continue;
             // The Host exited on its own (for example its watchdog fired): restart it.
             const auto serial = host.serial;
-            (void)StartHost(window, index + 1, serial);
+            const auto device = find(serial);
+            (void)StartHost(window, index + 1, serial, device != devices.end() ? device->address : host.address);
         }
 
         for (const auto& device : devices)
@@ -747,7 +861,7 @@ namespace
             });
             if (hasHost) continue;
             const auto monitor = AssignMonitor(device.serial);
-            if (monitor != 0) (void)StartHost(window, monitor, device.serial);
+            if (monitor != 0) (void)StartHost(window, monitor, device.serial, device.address);
         }
         UpdateTrayTip();
     }
@@ -804,11 +918,7 @@ namespace
         const wchar_t* const englishLabels[] = {
             L"Native", L"2 times smaller", L"3 times smaller", L"4 times smaller",
         };
-        std::vector<AdbDevice> devices;
-        {
-            std::lock_guard lock(g_devicesMutex);
-            devices = g_devices;
-        }
+        const auto devices = CombinedDevices();
         // Every connected tablet has its own resolution submenu, named after its monitor.
         bool listedTablet{};
         for (DWORD index = 0; index < kMaxMonitors; ++index)
@@ -896,6 +1006,45 @@ namespace
                     ? L"\u041f\u043b\u0430\u043d\u0448\u0435\u0442\u0438 \u043d\u0435 \u043f\u0456\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0456"
                     : L"No tablets connected");
         }
+        // Wi-Fi: tablets found on the network that are not paired yet, and the paired ones.
+        g_pairCandidates.clear();
+        g_forgetCandidates = tabletdisplay::wifi::LoadPairings();
+        {
+            std::set<std::wstring> paired;
+            for (const auto& tablet : g_forgetCandidates) paired.insert(tabletdisplay::wifi::ToHex(tablet.id));
+            std::lock_guard lock(g_devicesMutex);
+            for (const auto& [id, seen] : g_wifiTablets)
+            {
+                if (!paired.contains(id) && g_pairCandidates.size() < kMaxWifiMenuItems)
+                    g_pairCandidates.push_back(seen.tablet);
+            }
+        }
+        (void)AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        for (UINT index = 0; index < g_pairCandidates.size(); ++index)
+        {
+            const auto label = (ukrainian ? L"\u041f\u0456\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0438 \u043f\u043e Wi-Fi: " : L"Pair over Wi-Fi: ") +
+                g_pairCandidates[index].name + L" (" + g_pairCandidates[index].address + L")";
+            (void)AppendMenuW(menu, MF_STRING, kPairCommandBase + index, label.c_str());
+        }
+        if (g_pairCandidates.empty())
+        {
+            (void)AppendMenuW(menu, MF_STRING | MF_GRAYED, 0,
+                (ukrainian ? L"Wi-Fi: \u043d\u043e\u0432\u0438\u0445 \u043f\u043b\u0430\u043d\u0448\u0435\u0442\u0456\u0432 \u043d\u0435 \u0437\u043d\u0430\u0439\u0434\u0435\u043d\u043e" : L"Wi-Fi: no new tablets found"));
+        }
+        if (!g_forgetCandidates.empty())
+        {
+            const auto forgetMenu = CreatePopupMenu();
+            if (forgetMenu)
+            {
+                for (UINT index = 0; index < g_forgetCandidates.size() && index < kMaxWifiMenuItems; ++index)
+                {
+                    (void)AppendMenuW(forgetMenu, MF_STRING, kForgetCommandBase + index,
+                        g_forgetCandidates[index].name.c_str());
+                }
+                (void)AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(forgetMenu),
+                    (ukrainian ? L"\u0417\u0430\u0431\u0443\u0442\u0438 Wi-Fi \u043f\u043b\u0430\u043d\u0448\u0435\u0442" : L"Forget a Wi-Fi tablet"));
+            }
+        }
         (void)AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         (void)AppendMenuW(menu, autoStartFlags, kAutoStartCommand, autoStartText);
         (void)AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -907,6 +1056,68 @@ namespace
             point.x, point.y, 0, window, nullptr);
         (void)DestroyMenu(menu);
         (void)PostMessageW(window, WM_NULL, 0, 0);
+    }
+
+    std::wstring WidenUtf8(const std::string& text)
+    {
+        if (text.empty()) return {};
+        const auto size = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+        std::wstring output(static_cast<std::size_t>(std::max(size, 0)), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), output.data(), size);
+        return output;
+    }
+
+    // Pairs one tablet on a worker thread: the user compares the six-digit code on both screens
+    // (doc/PROTOCOL.md section 10.3).
+    void PairTablet(HWND window, tabletdisplay::wifi::DiscoveredTablet tablet)
+    {
+        // One pairing at a time; the previous worker has finished once the flag is clear.
+        if (g_pairingActive.exchange(true)) return;
+        if (g_pairingWorker.joinable()) g_pairingWorker.join();
+        g_pairingWorker = std::jthread([window, tablet]
+        {
+            namespace wifi = tabletdisplay::wifi;
+            const auto ukrainian = IsUkrainianUi();
+            std::wstring result;
+            UINT icon = MB_ICONINFORMATION;
+            SOCKET socket = INVALID_SOCKET;
+            try
+            {
+                socket = wifi::ConnectTcp(tablet.address, tablet.port, 3'000);
+                auto paired = wifi::Pair(socket, wifi::WindowsId(), wifi::WindowsName(),
+                    [&](const std::string& code, const std::wstring& tabletName)
+                    {
+                        const auto spaced = WidenUtf8(code.substr(0, 3) + " " + code.substr(3));
+                        const auto text = (ukrainian ? L"\u041f\u0435\u0440\u0435\u0432\u0456\u0440\u0442\u0435, \u0449\u043e \u043d\u0430 \u043f\u043b\u0430\u043d\u0448\u0435\u0442\u0456 \u00ab" : L"Check that the tablet \u201c") +
+                            tabletName + (ukrainian ? L"\u00bb \u043f\u043e\u043a\u0430\u0437\u0430\u043d\u043e \u043a\u043e\u0434\n\n" : L"\u201d shows the code\n\n") + spaced +
+                            (ukrainian ? L"\n\n\u041a\u043e\u0434\u0438 \u0437\u0431\u0456\u0433\u0430\u044e\u0442\u044c\u0441\u044f? \u041f\u0456\u0434\u0442\u0432\u0435\u0440\u0434\u0456\u0442\u044c \u0442\u0430\u043a\u043e\u0436 \u043d\u0430 \u043f\u043b\u0430\u043d\u0448\u0435\u0442\u0456." : L"\n\nDo the codes match? Confirm on the tablet as well.");
+                        return MessageBoxW(nullptr, text.c_str(), L"TabletDisplay Wi-Fi",
+                            MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES;
+                    });
+                if (paired)
+                {
+                    paired->address = tablet.address;
+                    paired->port = tablet.port;
+                    wifi::SavePairing(*paired);
+                    result = (ukrainian ? L"\u041f\u043b\u0430\u043d\u0448\u0435\u0442 \u00ab" : L"The tablet \u201c") + paired->name +
+                        (ukrainian ? L"\u00bb \u043f\u0456\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043e \u043f\u043e Wi-Fi." : L"\u201d is paired over Wi-Fi.");
+                }
+                else
+                {
+                    result = (ukrainian ? L"\u041f\u0456\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u043d\u044f \u0441\u043a\u0430\u0441\u043e\u0432\u0430\u043d\u043e." : L"Pairing was cancelled.");
+                    icon = MB_ICONWARNING;
+                }
+            }
+            catch (const std::exception& exception)
+            {
+                result = (ukrainian ? L"\u041d\u0435 \u0432\u0434\u0430\u043b\u043e\u0441\u044f \u043f\u0456\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0438 \u043f\u043b\u0430\u043d\u0448\u0435\u0442: " : L"Pairing failed: ") + WidenUtf8(exception.what());
+                icon = MB_ICONERROR;
+            }
+            if (socket != INVALID_SOCKET) closesocket(socket);
+            MessageBoxW(nullptr, result.c_str(), L"TabletDisplay Wi-Fi", MB_OK | icon | MB_TOPMOST | MB_SETFOREGROUND);
+            g_pairingActive = false;
+            (void)PostMessageW(window, kPairingFinishedMessage, 0, 0);
+        });
     }
 
     LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -927,6 +1138,10 @@ namespace
             (void)WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION);
             AddTrayIcon(window);
             g_deviceWatcher = std::jthread(WatchDevices, window);
+            g_wifiWatcher = std::jthread(WatchWifiTablets, window);
+            return 0;
+        case kPairingFinishedMessage:
+            ReconcileHosts(window);
             return 0;
         case WM_WTSSESSION_CHANGE:
             if (wParam == WTS_SESSION_LOCK && !g_sessionLocked)
@@ -1025,6 +1240,25 @@ namespace
                 }
                 return 0;
             }
+            if (LOWORD(wParam) >= kPairCommandBase && LOWORD(wParam) < kPairCommandBase + kMaxWifiMenuItems)
+            {
+                const auto index = LOWORD(wParam) - kPairCommandBase;
+                if (index < g_pairCandidates.size()) PairTablet(window, g_pairCandidates[index]);
+                return 0;
+            }
+            if (LOWORD(wParam) >= kForgetCommandBase && LOWORD(wParam) < kForgetCommandBase + kMaxWifiMenuItems)
+            {
+                const auto index = LOWORD(wParam) - kForgetCommandBase;
+                if (index < g_forgetCandidates.size())
+                {
+                    const auto serial = kWifiSerialPrefix + tabletdisplay::wifi::ToHex(g_forgetCandidates[index].id);
+                    tabletdisplay::wifi::RemovePairing(g_forgetCandidates[index].id);
+                    std::array<bool, kMaxMonitors> selected{};
+                    for (DWORD slot = 0; slot < kMaxMonitors; ++slot) selected[slot] = g_hosts[slot].serial == serial;
+                    StopHosts(window, selected);
+                }
+                return 0;
+            }
             if (LOWORD(wParam) == kExitCommand)
             {
                 DestroyWindow(window);
@@ -1039,6 +1273,7 @@ namespace
         case WM_DESTROY:
             g_exiting = true;
             g_deviceWatcher.request_stop();
+            g_wifiWatcher.request_stop();
             (void)WTSUnRegisterSessionNotification(window);
             if (g_displayPowerNotification)
             {
@@ -1049,6 +1284,8 @@ namespace
             if (g_trayIcon.hIcon) DestroyIcon(g_trayIcon.hIcon);
             StopAllHostsNow();
             if (g_deviceWatcher.joinable()) g_deviceWatcher.join();
+            if (g_wifiWatcher.joinable()) g_wifiWatcher.join();
+            if (g_pairingWorker.joinable()) g_pairingWorker.detach();
             PostQuitMessage(0);
             return 0;
         }
@@ -1065,6 +1302,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         return 0;
     }
 
+    WSADATA winsock{};
+    if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);

@@ -61,6 +61,7 @@
     <ClCompile Include="..\shared\protocol\Protocol.cpp" />
     <ClCompile Include="..\shared\video\SyntheticH264.cpp" />
     <ClCompile Include="..\shared\video\VideoProcessing.cpp" />
+    <ClCompile Include="..\shared\wifi\WifiCrypto.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\shared\ipc\FrameTransport.h" />

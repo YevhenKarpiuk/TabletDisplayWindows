@@ -582,10 +582,12 @@ bool FrameStore::CreateSharedTextureLocked(
     }
 
     // The driver host runs as LocalService and the TabletDisplay Host in the interactive
-    // user session. Nobody else may open the virtual desktop texture by its name.
+    // user session. Nobody else may open the virtual desktop texture by its name. The
+    // medium mandatory label lets the medium-integrity Host open it for writing (the keyed
+    // mutex); without it the object inherits the driver host's higher integrity level.
     PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)",
+            L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)S:(ML;;NW;;;ME)",
             SDDL_REVISION_1,
             &securityDescriptor,
             nullptr))
