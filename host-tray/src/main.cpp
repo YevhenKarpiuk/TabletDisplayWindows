@@ -35,6 +35,10 @@ namespace
     // divided by N (1..4).
     constexpr UINT kResolutionCommandBase = 1100;
     constexpr UINT kResolutionCommandStride = 10;
+    // Within a monitor's command range: refresh rate choices and the decoder limit override.
+    constexpr UINT kFps60CommandOffset = 5;
+    constexpr UINT kFps30CommandOffset = 6;
+    constexpr UINT kIgnoreDecoderLimitCommandOffset = 7;
     constexpr DWORD kMaxResolutionDivisor = 4;
     // One TabletDisplay monitor, Host process and adb forward port per connected tablet;
     // the driver offers up to four monitors.
@@ -212,6 +216,25 @@ namespace
         const auto result = RegGetValueW(
             HKEY_CURRENT_USER, key.c_str(), name, RRF_RT_REG_DWORD, nullptr, &value, &valueBytes);
         return result == ERROR_SUCCESS ? value : fallback;
+    }
+
+    bool SetDeviceValue(const std::wstring& serial, const wchar_t* name, DWORD value) noexcept
+    {
+        const auto key = kDevicesKey + serial;
+        return RegSetKeyValueW(
+            HKEY_CURRENT_USER, key.c_str(), name, REG_DWORD, &value, sizeof(value)) == ERROR_SUCCESS;
+    }
+
+    // The virtual display refresh and stream rate chosen for the tablet: 60 or 30 Hz.
+    DWORD DeviceFps(const std::wstring& serial) noexcept
+    {
+        return DeviceValue(serial, L"Fps", 60) == 30 ? 30 : 60;
+    }
+
+    // Streams the chosen resolution even when the tablet decoder reports it cannot play it.
+    bool DeviceIgnoresDecoderLimit(const std::wstring& serial) noexcept
+    {
+        return DeviceValue(serial, L"IgnoreDecoderLimit", 0) != 0;
     }
 
     // Tablets without their own choice start with the resolution chosen before per-tablet settings.
@@ -644,6 +667,8 @@ namespace
             L"\" --monitor " + std::to_wstring(monitor) +
             L" --port " + std::to_wstring(kBasePort + monitor - 1) +
             L" --scale " + std::to_wstring(DeviceResolutionDivisor(serial)) +
+            L" --fps " + std::to_wstring(DeviceFps(serial)) +
+            (DeviceIgnoresDecoderLimit(serial) ? L" --ignore-decoder-limit" : L"") +
             L" --stop-event " + host.stopEventName;
         std::vector<wchar_t> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back(L'\0');
@@ -800,6 +825,7 @@ namespace
             const auto active = DeviceValue(serial, L"ActiveDivisor", 0);
             const auto shown = streaming && active >= 1 && active <= kMaxResolutionDivisor ? active : selected;
             const auto minimum = std::clamp<DWORD>(DeviceValue(serial, L"MinimumDivisor", 1), 1, kMaxResolutionDivisor);
+            const auto ignoreDecoderLimit = DeviceIgnoresDecoderLimit(serial);
             for (DWORD divisor = 1; divisor <= kMaxResolutionDivisor; ++divisor)
             {
                 std::wstring label = (ukrainian ? ukrainianLabels : englishLabels)[divisor - 1];
@@ -815,10 +841,32 @@ namespace
                 }
                 (void)AppendMenuW(
                     resolutionMenu,
-                    MF_STRING | (divisor == shown ? MF_CHECKED : MF_UNCHECKED) | (unsupported ? MF_GRAYED : 0),
+                    MF_STRING | (divisor == shown ? MF_CHECKED : MF_UNCHECKED) |
+                        (unsupported && !ignoreDecoderLimit ? MF_GRAYED : 0),
                     kResolutionCommandBase + index * kResolutionCommandStride + divisor,
                     label.c_str());
             }
+            const auto commandBase = kResolutionCommandBase + index * kResolutionCommandStride;
+            const auto fps = DeviceFps(serial);
+            (void)AppendMenuW(resolutionMenu, MF_SEPARATOR, 0, nullptr);
+            (void)AppendMenuW(
+                resolutionMenu,
+                MF_STRING | (fps == 60 ? MF_CHECKED : MF_UNCHECKED),
+                commandBase + kFps60CommandOffset,
+                ukrainian ? L"60 \u0413\u0446" : L"60 Hz");
+            (void)AppendMenuW(
+                resolutionMenu,
+                MF_STRING | (fps == 30 ? MF_CHECKED : MF_UNCHECKED),
+                commandBase + kFps30CommandOffset,
+                ukrainian ? L"30 \u0413\u0446" : L"30 Hz");
+            (void)AppendMenuW(resolutionMenu, MF_SEPARATOR, 0, nullptr);
+            (void)AppendMenuW(
+                resolutionMenu,
+                MF_STRING | (ignoreDecoderLimit ? MF_CHECKED : MF_UNCHECKED),
+                commandBase + kIgnoreDecoderLimitCommandOffset,
+                ukrainian
+                    ? L"\u0406\u0433\u043d\u043e\u0440\u0443\u0432\u0430\u0442\u0438 \u043e\u0431\u043c\u0435\u0436\u0435\u043d\u043d\u044f \u0434\u0435\u043a\u043e\u0434\u0435\u0440\u0430"
+                    : L"Ignore the decoder limit");
             const auto device = std::find_if(devices.begin(), devices.end(), [&](const AdbDevice& candidate)
             {
                 return candidate.serial == serial;
@@ -829,7 +877,12 @@ namespace
             auto title = (ukrainian ? L"\u041c\u043e\u043d\u0456\u0442\u043e\u0440 " : L"Monitor ") +
                 std::to_wstring(index + 1) + L": " + name;
             if (const auto mode = DeviceMode(serial, shown); mode && streaming)
+            {
                 title += L" \u2014 " + std::to_wstring(mode->width) + L"\u00d7" + std::to_wstring(mode->height);
+                const auto activeFps = DeviceValue(serial, L"ActiveFps", 0);
+                if (activeFps != 0)
+                    title += L" @ " + std::to_wstring(activeFps) + (ukrainian ? L" \u0413\u0446" : L" Hz");
+            }
             (void)AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(resolutionMenu), title.c_str());
             listedTablet = true;
         }
@@ -943,12 +996,26 @@ namespace
                 LOWORD(wParam) < kResolutionCommandBase + kMaxMonitors * kResolutionCommandStride)
             {
                 const DWORD index = (LOWORD(wParam) - kResolutionCommandBase) / kResolutionCommandStride;
-                const DWORD divisor = (LOWORD(wParam) - kResolutionCommandBase) % kResolutionCommandStride;
+                const DWORD offset = (LOWORD(wParam) - kResolutionCommandBase) % kResolutionCommandStride;
                 const auto serial = g_hosts[index].serial;
-                if (divisor >= 1 && divisor <= kMaxResolutionDivisor && !serial.empty() &&
-                    !g_hosts[index].stopping &&
-                    divisor != DeviceResolutionDivisor(serial) &&
-                    SetDeviceResolutionDivisor(serial, divisor))
+                if (serial.empty() || g_hosts[index].stopping) return 0;
+                bool changed{};
+                if (offset >= 1 && offset <= kMaxResolutionDivisor)
+                {
+                    changed = offset != DeviceResolutionDivisor(serial) &&
+                        SetDeviceResolutionDivisor(serial, offset);
+                }
+                else if (offset == kFps60CommandOffset || offset == kFps30CommandOffset)
+                {
+                    const DWORD fps = offset == kFps60CommandOffset ? 60 : 30;
+                    changed = fps != DeviceFps(serial) && SetDeviceValue(serial, L"Fps", fps);
+                }
+                else if (offset == kIgnoreDecoderLimitCommandOffset)
+                {
+                    changed = SetDeviceValue(
+                        serial, L"IgnoreDecoderLimit", DeviceIgnoresDecoderLimit(serial) ? 0 : 1);
+                }
+                if (changed)
                 {
                     // The Host chooses the monitor mode when it connects, so restart only its Host.
                     std::array<bool, kMaxMonitors> selected{};

@@ -119,6 +119,11 @@ namespace
     HANDLE g_stopEvent{};
     // The driver monitor this Host leased; every tablet streams its own virtual monitor.
     std::uint32_t g_monitorSlot{};
+    // Virtual display refresh and encoding rate (--fps 60|30).
+    std::uint16_t g_streamFps = 60;
+    // --ignore-decoder-limit streams the chosen resolution even beyond the decoder limits the
+    // tablet reports; many decoders play more than they declare.
+    bool g_ignoreDecoderLimit{};
     std::atomic<std::uint64_t> g_lastProgressMs{ GetTickCount64() };
 
     [[nodiscard]] bool StopRequested() noexcept
@@ -1236,13 +1241,14 @@ namespace
         std::uint32_t nativeHeight,
         bool portrait,
         std::uint32_t activeDivisor,
-        std::uint32_t minimumDivisor) noexcept
+        std::uint32_t minimumDivisor,
+        std::uint32_t fps) noexcept
     {
         const auto key = L"Software\\TabletDisplay\\Devices\\" + Widen(serial);
         const DWORD values[] = {
-            nativeWidth, nativeHeight, portrait ? 1UL : 0UL, activeDivisor, minimumDivisor };
+            nativeWidth, nativeHeight, portrait ? 1UL : 0UL, activeDivisor, minimumDivisor, fps };
         const wchar_t* const names[] = {
-            L"NativeWidth", L"NativeHeight", L"Portrait", L"ActiveDivisor", L"MinimumDivisor" };
+            L"NativeWidth", L"NativeHeight", L"Portrait", L"ActiveDivisor", L"MinimumDivisor", L"ActiveFps" };
         for (std::size_t index = 0; index < std::size(values); ++index)
         {
             (void)RegSetKeyValueW(
@@ -1283,7 +1289,8 @@ namespace
         auto divisor = resolutionDivisor;
         auto landscape = modes::ScaledMode(native.width, native.height, divisor);
         while (divisor <= modes::kMaxResolutionDivisor &&
-            (!modes::IsSupportedMode(landscape) || !DecoderAccepts(landscape, display)))
+            (!modes::IsSupportedMode(landscape) ||
+             (!g_ignoreDecoderLimit && !DecoderAccepts(landscape, display))))
         {
             ++divisor;
             landscape = modes::ScaledMode(native.width, native.height, divisor);
@@ -1314,12 +1321,12 @@ namespace
         ReportProgress();
         const auto orientation = WaitForTabletDisplayOrientation();
         const bool portrait = orientation == DMDO_90 || orientation == DMDO_270;
-        SaveTabletDisplay(serial, native.width, native.height, portrait, divisor, minimumDivisor);
+        SaveTabletDisplay(serial, native.width, native.height, portrait, divisor, minimumDivisor, g_streamFps);
         const auto rawWidth = static_cast<std::uint16_t>(landscape.width);
         const auto rawHeight = static_cast<std::uint16_t>(landscape.height);
         const std::uint16_t width = portrait ? rawHeight : rawWidth;
         const std::uint16_t height = portrait ? rawWidth : rawHeight;
-        constexpr std::uint16_t fps = 60;
+        const std::uint16_t fps = g_streamFps;
         const auto bitrate = BitrateFor(width, height, fps);
         std::cout << "Tablet " << native.width << 'x' << native.height << ", resolution 1/" << divisor
             << " -> " << width << 'x' << height << ", " << bitrate / 1'000U << " kbit/s\n";
@@ -1824,10 +1831,13 @@ namespace
             << "  TabletDisplayHost --encoder-demo [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N] [--reconnect]\n"
-            << "                    [--scale 1|2|3|4] [--monitor 1|2|3|4] [--port PORT] [--stop-event NAME]\n"
+            << "                    [--scale 1|2|3|4] [--fps 60|30] [--ignore-decoder-limit]\n"
+            << "                    [--monitor 1|2|3|4] [--port PORT] [--stop-event NAME]\n"
             << "  TabletDisplayHost --version\n"
             << "--seconds 0 streams the virtual display until the stop event is signaled.\n"
             << "--scale N divides the tablet resolution by N, keeping its aspect ratio (default 1).\n"
+            << "--fps 60|30 sets the virtual display refresh and stream rate (default 60).\n"
+            << "--ignore-decoder-limit streams the chosen resolution beyond the decoder limits the tablet reports.\n"
             << "--monitor N streams TabletDisplay monitor N (default: the first free one), so several\n"
             << "  tablets can run one Host each; every Host needs its own --serial and --port.\n"
             << "--port PORT is the local adb forward port (default " << kPort << ").\n";
@@ -2059,6 +2069,16 @@ int main(int argc, char* argv[])
                         throw std::runtime_error("--port must be in 1024..65535");
                     localPort = static_cast<std::uint16_t>(parsed);
                 }
+                else if (option == "--fps" && index + 1 < argc && command == "--virtual-stream")
+                {
+                    const auto parsed = std::stoul(argv[++index]);
+                    if (parsed != 60 && parsed != 30) throw std::runtime_error("--fps must be 60 or 30");
+                    g_streamFps = static_cast<std::uint16_t>(parsed);
+                }
+                else if (option == "--ignore-decoder-limit" && command == "--virtual-stream")
+                {
+                    g_ignoreDecoderLimit = true;
+                }
                 else if (option == "--reconnect" && command == "--virtual-stream")
                 {
                     reconnect = true;
@@ -2072,7 +2092,7 @@ int main(int argc, char* argv[])
                 else
                 {
                     throw std::runtime_error(
-                        "Expected [--serial SERIAL] [--seconds N] [--reconnect] [--scale N] [--monitor N] "
+                        "Expected [--serial SERIAL] [--seconds N] [--reconnect] [--scale N] [--fps N] [--ignore-decoder-limit] [--monitor N] "
                         "[--port PORT] [--stop-event NAME]");
                 }
             }
