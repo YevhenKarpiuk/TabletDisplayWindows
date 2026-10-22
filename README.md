@@ -1,22 +1,41 @@
 # TabletDisplayWindows
 
-Windows-часть TabletDisplay: IddCx/UMDF-драйвер виртуального дисплея и пользовательский host-процесс.
+Windows-часть TabletDisplay: превращает Android-планшет или телефон в дополнительный монитор Windows 11 по USB или Wi-Fi. Приёмник для Android — [TabletDisplayAndroid](https://github.com/YevhenKarpiuk/TabletDisplayAndroid).
 
-Доступны IddCx-каркас, ADB/TCP session, synthetic video, проверка настоящего Media Foundation encoder и захват основного Windows-дисплея через DXGI Desktop Duplication:
+## Возможности
+
+- Виртуальный монитор Windows через IddCx-драйвер (UMDF 2): появляется при подключении планшета и исчезает при отключении.
+- Разрешение по планшету: исходное разрешение экрана или в 2, 3, 4 раза меньше с тем же соотношением сторон; ландшафт и портрет; 60 или 30 Гц.
+- До четырёх устройств одновременно, у каждого свой монитор и свои настройки.
+- Видео H.264 с аппаратным кодированием (Intel Quick Sync, Media Foundation), zero-copy путь кадров драйвер → GPU → кодировщик, кадры только при изменении картинки.
+- Касания планшета управляют мышью Windows.
+- USB через ADB или Wi-Fi без ADB: сопряжение по шестизначному коду, шифрование AES-256-GCM.
+- Приложение в трее: автозапуск, выбор разрешения и частоты для каждого устройства, подключение по Wi-Fi, остановка потока при блокировке и выключении дисплеев.
+
+## Установка
+
+Готовые пакеты лежат в [`prebuilt/`](prebuilt):
+
+1. `TabletDisplayDriver-0.2.0.zip` — распакуйте и запустите `Install.cmd` (нужны права администратора). Драйвер подписан тестовым сертификатом; если Windows его не загружает (код 52), смотрите раздел Test-signing в [doc/BUILD.md](doc/BUILD.md).
+2. `TabletDisplayHostPortable-0.2.0.zip` — распакуйте и запустите `TabletDisplay.exe`; он работает в трее, ADB уже в комплекте.
+3. На устройство установите APK из [TabletDisplayAndroid/prebuilt](https://github.com/YevhenKarpiuk/TabletDisplayAndroid/tree/main/prebuilt) и откройте приложение.
+4. USB: включите отладку по USB и подключите кабель. Wi-Fi: в меню трея выберите «Підключити по Wi-Fi: <устройство>» и подтвердите одинаковый код на компьютере и устройстве.
+
+## Сборка
+
+Нужны Visual Studio 2022 (MSVC v143, WDK, Spectre-библиотеки x64); WDK/SDK 10.0.26100.6584 скачивается скриптом.
 
 ```cmd
-build.cmd
+build.cmd Release
 test.cmd
 install-driver.cmd Release
-check-driver.cmd
-demo.cmd
-encoder-demo.cmd --seconds 5
-stream.cmd --seconds 10
-virtual-stream.cmd --seconds 10
+release.cmd
 ```
 
-`stream.cmd` передаёт основной физический дисплей через Desktop Duplication. `virtual-stream.cmd` включает режим «Расширить», получает последний BGRA-кадр виртуального монитора через read-only IOCTL драйвера и передаёт его существующим H.264-конвейером. Обе команды запускайте из обычного интерактивного пользовательского сеанса Windows.
+`release.cmd` собирает пакеты драйвера и Host в `dist\`. Остальные команды и детали подписи — в [doc/BUILD.md](doc/BUILD.md).
 
-`install-driver.cmd Release` собирает, test-sign-подписывает и устанавливает IddCx-пакет с запросом UAC. Для отката используйте `uninstall-driver.cmd`; детали Secure Boot/Test Mode описаны в [doc/BUILD.md](doc/BUILD.md).
+## Документация
 
-Подробности: [doc/BUILD.md](doc/BUILD.md) и [doc/IMPLEMENTATION_PLAN.md](doc/IMPLEMENTATION_PLAN.md).
+- [doc/PROTOCOL.md](doc/PROTOCOL.md) — протокол v1 и Wi-Fi транспорт (одинаковый в обоих репозиториях).
+- [doc/BUILD.md](doc/BUILD.md) — окружение, команды, test-signing.
+- [CONTEXT.md](CONTEXT.md) — текущее состояние проекта.
