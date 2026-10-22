@@ -19,6 +19,9 @@ Environment:
 #include "Driver.tmh"
 
 #include <bcrypt.h>
+#include <sddl.h>
+
+#include "display/DisplayModes.h"
 
 using namespace std;
 using namespace Microsoft::IndirectDisp;
@@ -29,15 +32,6 @@ using namespace Microsoft::WRL;
 static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 1;
 static constexpr GUID TABLET_DISPLAY_MONITOR_CONTAINER_ID =
 { 0x05211a31, 0x67e4, 0x4536, { 0x9d, 0x42, 0xae, 0xfc, 0xdf, 0x0a, 0xf1, 0x83 } };
-
-// Default modes reported for edid-less monitors. The first mode is set as preferred
-static const struct IndirectSampleMonitor::SampleMonitorMode s_SampleDefaultModes[] =
-{
-    { 1920, 1200, 60 },
-    { 1920, 1200, 30 },
-    { 1280,  800, 60 },
-    { 1280,  800, 30 },
-};
 
 // FOR SAMPLE PURPOSES ONLY, Static info about monitors that will be reported to OS
 static const struct IndirectSampleMonitor s_SampleMonitors[] =
@@ -81,6 +75,77 @@ static const struct IndirectSampleMonitor s_SampleMonitors[] =
         0
     }
 };
+
+#pragma endregion
+
+#pragma region TabletModes
+
+namespace
+{
+    struct TabletMode
+    {
+        DWORD Width;
+        DWORD Height;
+        DWORD VSync;
+    };
+
+    // Set by the Host before monitor arrival: the tablet panel resolution and the divisor the
+    // user selected. IddCx asks for monitor and target modes during arrival.
+    SRWLOCK s_TabletModeLock = SRWLOCK_INIT;
+    UINT s_TabletNativeWidth = 0;
+    UINT s_TabletNativeHeight = 0;
+    UINT s_TabletPreferredDivisor = tabletdisplay::display::kMinResolutionDivisor;
+
+    void SetTabletModes(UINT nativeWidth, UINT nativeHeight, UINT preferredDivisor)
+    {
+        AcquireSRWLockExclusive(&s_TabletModeLock);
+        s_TabletNativeWidth = nativeWidth;
+        s_TabletNativeHeight = nativeHeight;
+        s_TabletPreferredDivisor = preferredDivisor;
+        ReleaseSRWLockExclusive(&s_TabletModeLock);
+    }
+
+    // The tablet resolution divided by 1..4 keeps the tablet aspect ratio; each size is
+    // offered at 60 and 30 Hz. Without a tablet resolution the legacy modes are reported.
+    vector<TabletMode> CurrentTabletModes(DWORD* preferredIndex)
+    {
+        AcquireSRWLockShared(&s_TabletModeLock);
+        const auto nativeWidth = s_TabletNativeWidth;
+        const auto nativeHeight = s_TabletNativeHeight;
+        const auto preferredDivisor = s_TabletPreferredDivisor;
+        ReleaseSRWLockShared(&s_TabletModeLock);
+
+        vector<TabletMode> modes;
+        DWORD preferred = 0;
+        if (nativeWidth == 0 || nativeHeight == 0)
+        {
+            modes = { { 1920, 1200, 60 }, { 1920, 1200, 30 }, { 1280, 800, 60 }, { 1280, 800, 30 } };
+        }
+        else
+        {
+            for (UINT divisor = tabletdisplay::display::kMinResolutionDivisor;
+                 divisor <= tabletdisplay::display::kMaxResolutionDivisor;
+                 ++divisor)
+            {
+                const auto mode = tabletdisplay::display::ScaledMode(nativeWidth, nativeHeight, divisor);
+                if (!tabletdisplay::display::IsSupportedMode(mode))
+                    continue;
+                bool duplicate = false;
+                for (const auto& existing : modes)
+                    duplicate = duplicate || (existing.Width == mode.width && existing.Height == mode.height);
+                if (duplicate)
+                    continue;
+                if (divisor == preferredDivisor)
+                    preferred = static_cast<DWORD>(modes.size());
+                modes.push_back({ mode.width, mode.height, 60 });
+                modes.push_back({ mode.width, mode.height, 30 });
+            }
+        }
+        if (preferredIndex != nullptr)
+            *preferredIndex = preferred;
+        return modes;
+    }
+}
 
 #pragma endregion
 
@@ -453,22 +518,29 @@ bool FrameStore::CreateSharedTextureLocked(
         return false;
     }
 
-    SECURITY_DESCRIPTOR securityDescriptor = {};
-    if (!InitializeSecurityDescriptor(&securityDescriptor, SECURITY_DESCRIPTOR_REVISION) ||
-        !SetSecurityDescriptorDacl(&securityDescriptor, TRUE, nullptr, FALSE))
+    // The driver host runs as LocalService and the TabletDisplay Host in the interactive
+    // user session. Nobody else may open the virtual desktop texture by its name.
+    PSECURITY_DESCRIPTOR securityDescriptor = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;IU)",
+            SDDL_REVISION_1,
+            &securityDescriptor,
+            nullptr))
     {
         return false;
     }
     SECURITY_ATTRIBUTES securityAttributes = {};
     securityAttributes.nLength = sizeof(securityAttributes);
-    securityAttributes.lpSecurityDescriptor = &securityDescriptor;
+    securityAttributes.lpSecurityDescriptor = securityDescriptor;
 
     HANDLE sharedHandle = nullptr;
-    if (FAILED(resource->CreateSharedHandle(
-            &securityAttributes,
-            DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-            resourceName,
-            &sharedHandle)))
+    const HRESULT sharedHandleResult = resource->CreateSharedHandle(
+        &securityAttributes,
+        DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+        resourceName,
+        &sharedHandle);
+    LocalFree(securityDescriptor);
+    if (FAILED(sharedHandleResult))
     {
         return false;
     }
@@ -979,34 +1051,56 @@ IndirectDeviceContext::~IndirectDeviceContext()
 {
 }
 
+bool IndirectDeviceContext::IsMonitorLeaseOwner(WDFFILEOBJECT fileObject)
+{
+    lock_guard lock(m_MonitorMutex);
+    return fileObject != nullptr && m_MonitorLeaseFile == fileObject;
+}
+
+// Frames and the frame transport belong to the process that connected the monitor, so other
+// processes that can open the device interface cannot read the virtual desktop.
 NTSTATUS IndirectDeviceContext::CopyLatestFrame(
+    WDFFILEOBJECT fileObject,
     UINT64 afterSequence,
     void* output,
     size_t outputBytes,
     size_t* bytesWritten)
 {
+    if (!IsMonitorLeaseOwner(fileObject))
+        return STATUS_ACCESS_DENIED;
     return m_Frames->CopyLatest(afterSequence, output, outputBytes, bytesWritten);
 }
 
 NTSTATUS IndirectDeviceContext::CopySharedFrame(
+    WDFFILEOBJECT fileObject,
     UINT64 afterSequence,
     UINT64 afterGeneration,
     void* output,
     size_t outputBytes,
     size_t* bytesWritten)
 {
+    if (!IsMonitorLeaseOwner(fileObject))
+        return STATUS_ACCESS_DENIED;
     return m_Frames->CopyShared(
         afterSequence, afterGeneration, output, outputBytes, bytesWritten);
 }
 
-NTSTATUS IndirectDeviceContext::SetFrameTransport(UINT mode, UINT64 generation)
+NTSTATUS IndirectDeviceContext::SetFrameTransport(
+    WDFFILEOBJECT fileObject,
+    UINT mode,
+    UINT64 generation)
 {
+    if (!IsMonitorLeaseOwner(fileObject))
+        return STATUS_ACCESS_DENIED;
     return m_Frames->SetTransport(mode, generation);
 }
 
 NTSTATUS IndirectDeviceContext::SetMonitorConnection(
     WDFFILEOBJECT fileObject,
-    bool connected)
+    bool connected,
+    UINT nativeWidth,
+    UINT nativeHeight,
+    UINT preferredDivisor)
 {
     if (fileObject == nullptr)
         return STATUS_INVALID_HANDLE;
@@ -1022,6 +1116,8 @@ NTSTATUS IndirectDeviceContext::SetMonitorConnection(
 
         if (!m_MonitorConnected)
         {
+            // Monitor modes are queried during arrival, so they must be known before it.
+            SetTabletModes(nativeWidth, nativeHeight, preferredDivisor);
             if (m_Monitor == nullptr)
             {
                 const auto Status = CreateMonitorLocked();
@@ -1292,6 +1388,7 @@ VOID IddSampleDeviceIoControl(
                 else
                 {
                     Status = DeviceContext->pContext->CopyLatestFrame(
+                        WdfRequestGetFileObject(Request),
                         FrameRequest->afterSequence,
                         Output,
                         OutputBufferLength,
@@ -1340,6 +1437,7 @@ VOID IddSampleDeviceIoControl(
                 else
                 {
                     Status = DeviceContext->pContext->CopySharedFrame(
+                        WdfRequestGetFileObject(Request),
                         FrameRequest->afterSequence,
                         FrameRequest->afterGeneration,
                         Output,
@@ -1378,6 +1476,7 @@ VOID IddSampleDeviceIoControl(
                 else
                 {
                     Status = DeviceContext->pContext->SetFrameTransport(
+                        WdfRequestGetFileObject(Request),
                         TransportRequest->mode,
                         TransportRequest->generation);
                 }
@@ -1405,6 +1504,22 @@ VOID IddSampleDeviceIoControl(
             {
                 Status = STATUS_INVALID_PARAMETER;
             }
+            UINT PreferredDivisor = tabletdisplay::display::kMinResolutionDivisor;
+            if (NT_SUCCESS(Status))
+            {
+                const bool LegacyModes =
+                    ConnectionRequest->nativeWidth == 0 && ConnectionRequest->nativeHeight == 0;
+                if (ConnectionRequest->preferredDivisor != 0)
+                    PreferredDivisor = ConnectionRequest->preferredDivisor;
+                const auto NativeMode = tabletdisplay::display::Landscape(
+                    ConnectionRequest->nativeWidth, ConnectionRequest->nativeHeight);
+                if (PreferredDivisor > tabletdisplay::display::kMaxResolutionDivisor ||
+                    (!LegacyModes && !tabletdisplay::display::IsSupportedMode(
+                        tabletdisplay::display::ScaledMode(NativeMode.width, NativeMode.height, 1))))
+                {
+                    Status = STATUS_INVALID_PARAMETER;
+                }
+            }
             if (NT_SUCCESS(Status))
             {
                 auto* DeviceContext = WdfObjectGet_IndirectDeviceContextWrapper(Device);
@@ -1418,7 +1533,10 @@ VOID IddSampleDeviceIoControl(
                 {
                     Status = DeviceContext->pContext->SetMonitorConnection(
                         FileObject,
-                        ConnectionRequest->connected != 0);
+                        ConnectionRequest->connected != 0,
+                        ConnectionRequest->nativeWidth,
+                        ConnectionRequest->nativeHeight,
+                        PreferredDivisor);
                 }
             }
         }
@@ -1479,9 +1597,11 @@ NTSTATUS IddSampleParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION
     // this sample driver, we hard-code the EDID, so this function can generate known modes.
     // ==============================
 
-    pOutArgs->MonitorModeBufferOutputCount = IndirectSampleMonitor::szModeList;
+    DWORD PreferredModeIndex = 0;
+    const auto Modes = CurrentTabletModes(&PreferredModeIndex);
+    pOutArgs->MonitorModeBufferOutputCount = static_cast<UINT>(Modes.size());
 
-    if (pInArgs->MonitorModeBufferInputCount < IndirectSampleMonitor::szModeList)
+    if (pInArgs->MonitorModeBufferInputCount < Modes.size())
     {
         // Return success if there was no buffer, since the caller was only asking for a count of modes
         return (pInArgs->MonitorModeBufferInputCount > 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_SUCCESS;
@@ -1500,19 +1620,18 @@ NTSTATUS IddSampleParseMonitorDescription(const IDARG_IN_PARSEMONITORDESCRIPTION
         {
             if (memcmp(pInArgs->MonitorDescription.pData, s_SampleMonitors[SampleMonitorIdx].pEdidBlock, IndirectSampleMonitor::szEdidBlock) == 0)
             {
-                // Copy the known modes to the output buffer
-                for (DWORD ModeIndex = 0; ModeIndex < IndirectSampleMonitor::szModeList; ModeIndex++)
+                // The EDID only identifies the monitor; its modes follow the tablet resolution.
+                for (size_t ModeIndex = 0; ModeIndex < Modes.size(); ModeIndex++)
                 {
                     pInArgs->pMonitorModes[ModeIndex] = CreateIddCxMonitorMode(
-                        s_SampleMonitors[SampleMonitorIdx].pModeList[ModeIndex].Width,
-                        s_SampleMonitors[SampleMonitorIdx].pModeList[ModeIndex].Height,
-                        s_SampleMonitors[SampleMonitorIdx].pModeList[ModeIndex].VSync,
+                        Modes[ModeIndex].Width,
+                        Modes[ModeIndex].Height,
+                        Modes[ModeIndex].VSync,
                         IDDCX_MONITOR_MODE_ORIGIN_MONITORDESCRIPTOR
                     );
                 }
 
-                // Set the preferred mode as represented in the EDID
-                pOutArgs->PreferredMonitorModeIdx = s_SampleMonitors[SampleMonitorIdx].ulPreferredModeIdx;
+                pOutArgs->PreferredMonitorModeIdx = PreferredModeIndex;
 
                 return STATUS_SUCCESS;
             }
@@ -1535,24 +1654,23 @@ NTSTATUS IddSampleMonitorGetDefaultModes(IDDCX_MONITOR MonitorObject, const IDAR
     // than an EDID, those modes would also be reported here.
     // ==============================
 
-    if (pInArgs->DefaultMonitorModeBufferInputCount == 0)
+    DWORD PreferredModeIndex = 0;
+    const auto Modes = CurrentTabletModes(&PreferredModeIndex);
+    pOutArgs->DefaultMonitorModeBufferOutputCount = static_cast<UINT>(Modes.size());
+    if (pInArgs->DefaultMonitorModeBufferInputCount != 0)
     {
-        pOutArgs->DefaultMonitorModeBufferOutputCount = ARRAYSIZE(s_SampleDefaultModes);
-    }
-    else
-    {
-        for (DWORD ModeIndex = 0; ModeIndex < ARRAYSIZE(s_SampleDefaultModes); ModeIndex++)
+        if (pInArgs->DefaultMonitorModeBufferInputCount < Modes.size())
+            return STATUS_BUFFER_TOO_SMALL;
+        for (size_t ModeIndex = 0; ModeIndex < Modes.size(); ModeIndex++)
         {
             pInArgs->pDefaultMonitorModes[ModeIndex] = CreateIddCxMonitorMode(
-                s_SampleDefaultModes[ModeIndex].Width,
-                s_SampleDefaultModes[ModeIndex].Height,
-                s_SampleDefaultModes[ModeIndex].VSync,
+                Modes[ModeIndex].Width,
+                Modes[ModeIndex].Height,
+                Modes[ModeIndex].VSync,
                 IDDCX_MONITOR_MODE_ORIGIN_DRIVER
             );
         }
-
-        pOutArgs->DefaultMonitorModeBufferOutputCount = ARRAYSIZE(s_SampleDefaultModes);
-        pOutArgs->PreferredMonitorModeIdx = 0;
+        pOutArgs->PreferredMonitorModeIdx = PreferredModeIndex;
     }
 
     return STATUS_SUCCESS;
@@ -1569,10 +1687,10 @@ NTSTATUS IddSampleMonitorQueryModes(IDDCX_MONITOR MonitorObject, const IDARG_IN_
     // monitor's descriptor and instead are based on the static processing capability of the device. The OS will
     // report the available set of modes for a given output as the intersection of monitor modes with target modes.
 
-    TargetModes.push_back(CreateIddCxTargetMode(1920, 1200, 60));
-    TargetModes.push_back(CreateIddCxTargetMode(1920, 1200, 30));
-    TargetModes.push_back(CreateIddCxTargetMode(1280,  800, 60));
-    TargetModes.push_back(CreateIddCxTargetMode(1280,  800, 30));
+    for (const auto& Mode : CurrentTabletModes(nullptr))
+    {
+        TargetModes.push_back(CreateIddCxTargetMode(Mode.Width, Mode.Height, Mode.VSync));
+    }
 
     pOutArgs->TargetModeBufferOutputCount = (UINT) TargetModes.size();
 

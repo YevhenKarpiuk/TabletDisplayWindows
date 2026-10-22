@@ -1,3 +1,4 @@
+#include "display/DisplayModes.h"
 #include "ipc/FrameTransport.h"
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
@@ -351,10 +352,58 @@ int main(int argc, char* argv[])
         Check(frameRequest.structureBytes == sizeof(frameRequest), "frame IPC request layout");
         Check(frameHeader.magic == tabletdisplay::ipc::kFrameMagic &&
             frameHeader.headerBytes == sizeof(frameHeader), "frame IPC response layout");
-        Check(tabletdisplay::ipc::kMaxFrameWidth == 1920U &&
-            tabletdisplay::ipc::kMaxFrameHeight == 1920U &&
-            tabletdisplay::ipc::kMaxFrameBytes == 1920U * 1200U * 4U,
+        Check(tabletdisplay::ipc::kMaxFrameWidth == 3840U &&
+            tabletdisplay::ipc::kMaxFrameHeight == 3840U &&
+            tabletdisplay::ipc::kMaxFrameBytes == 3840U * 2400U * 4U,
             "frame IPC byte limit");
+        Check(sizeof(tabletdisplay::ipc::MonitorConnectionRequest) == 16, "monitor IPC request layout");
+
+        using tabletdisplay::display::ScaledMode;
+        const auto native = ScaledMode(1200, 1920, 1);
+        Check(native.width == 1920 && native.height == 1200, "native mode is landscape");
+        const auto third = ScaledMode(1920, 1200, 3);
+        Check(third.width == 640 && third.height == 400, "one third of 1920x1200");
+        const auto quarter = ScaledMode(2560, 1600, 4);
+        Check(quarter.width == 640 && quarter.height == 400, "one quarter of 2560x1600");
+        const auto oddThird = ScaledMode(2000, 1200, 3);
+        Check(oddThird.width == 666 && oddThird.height == 400, "scaled sides round down to even");
+        Check(ScaledMode(1920, 1200, 5).width == 0, "divisor above 4 is rejected");
+
+        const auto modeConfig = [](std::uint16_t width, std::uint16_t height)
+        {
+            std::vector<std::uint8_t> payload(28 + 4, 0);
+            payload[0] = 1;
+            payload[4] = 1;
+            payload[8] = static_cast<std::uint8_t>(width);
+            payload[9] = static_cast<std::uint8_t>(width >> 8U);
+            payload[10] = static_cast<std::uint8_t>(height);
+            payload[11] = static_cast<std::uint8_t>(height >> 8U);
+            payload[12] = 60;
+            payload[14] = 1;
+            payload[16] = 66;
+            payload[17] = 40;
+            payload[18] = 1;
+            payload[24] = 4;
+            payload[30] = 0;
+            payload[31] = 1;
+            const tabletdisplay::protocol::Header header{
+                static_cast<std::uint16_t>(tabletdisplay::protocol::MessageType::VideoConfig),
+                tabletdisplay::protocol::Critical,
+                static_cast<std::uint32_t>(payload.size()), 2, 1 };
+            tabletdisplay::protocol::ValidatePayload(header, payload);
+        };
+        modeConfig(960, 600);
+        modeConfig(600, 960);
+        bool oddRejected{};
+        try
+        {
+            modeConfig(961, 600);
+        }
+        catch (const tabletdisplay::protocol::ProtocolException&)
+        {
+            oddRejected = true;
+        }
+        Check(oddRejected, "odd VIDEO_CONFIG width is rejected");
 
         std::cout << "TabletDisplay protocol: 14 golden vectors, H.264, pixel and frame IPC passed\n";
         return 0;

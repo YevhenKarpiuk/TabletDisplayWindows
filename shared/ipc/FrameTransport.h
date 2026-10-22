@@ -18,11 +18,12 @@ namespace tabletdisplay::ipc
     inline constexpr std::uint16_t kFrameVersionMajor = 1;
     inline constexpr std::uint16_t kFrameVersionMinor = 0;
     inline constexpr std::uint32_t kPixelFormatBgra8 = 1;
-    inline constexpr std::uint32_t kMaxFrameWidth = 1920;
-    inline constexpr std::uint32_t kMaxFrameHeight = 1920;
+    // Landscape IddCx frames up to the largest tablet panels (3840x2400).
+    inline constexpr std::uint32_t kMaxFrameWidth = 3840;
+    inline constexpr std::uint32_t kMaxFrameHeight = 3840;
     inline constexpr std::uint32_t kBytesPerPixel = 4;
     inline constexpr std::uint32_t kMaxFrameBytes =
-        1920U * 1200U * kBytesPerPixel;
+        3840U * 2400U * kBytesPerPixel;
     inline constexpr std::uint32_t kSharedResourceNameChars = 96;
 
     struct FrameRequest
@@ -85,11 +86,16 @@ namespace tabletdisplay::ipc
         std::uint64_t generation{};
     };
 
+    // nativeWidth/nativeHeight describe the tablet panel; the monitor offers that resolution
+    // divided by 1..4. Zero keeps the legacy 1920x1200/1280x800 mode list.
     struct MonitorConnectionRequest
     {
         std::uint32_t structureBytes{ sizeof(MonitorConnectionRequest) };
         std::uint32_t connected{};
-        std::uint64_t reserved{};
+        std::uint16_t nativeWidth{};
+        std::uint16_t nativeHeight{};
+        std::uint16_t preferredDivisor{};
+        std::uint16_t reserved{};
     };
 
     inline constexpr ULONG kGetLatestFrameIoctl = CTL_CODE(

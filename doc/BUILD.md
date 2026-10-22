@@ -53,6 +53,8 @@ virtual-stream.cmd [--serial SERIAL] [--seconds N]
 - Driver — IddCx-база Microsoft IddSample; monitor lease управляет arrival/departure, а swap-chain выдаётся Host через shared-texture или latest-frame IOCTL.
 - Host 0.1.5 — ADB/session, динамический monitor lease после Android-handshake, мягкое отсоединение display path и повторная taskbar-регистрация окон после monitor departure, DXGI/IddCx capture, GPU/CPU NV12 conversion, Media Foundation H.264, protocol sender, tray-настройка автозапуска и отключение потока при выключении дисплеев Windows.
 - Software H264 MFT проверен FFmpeg (Constrained Baseline 1280×800) и планшетом: 150/150 кадров, аппаратный MTK decoder.
-- Intel Quick Sync MFT обнаружен; hardware output будет активирован с прямым GPU frame path от IddCx.
+- Intel Quick Sync MFT используется с прямым GPU frame path от IddCx (shared D3D11 texture).
+- Tray запускает `TabletDisplayHost --virtual-stream --reconnect --seconds 0 --stop-event NAME`: поток без ограничения времени, мягкая остановка по событию, watchdog 30 с и таймаут `adb` 20 с.
+- Разрешение: исходное разрешение планшета или в 2/3/4 раза меньше (меню tray «Роздільна здатність», ручной запуск `--scale N`). Если декодер планшета не тянет режим, Host берёт следующий делитель. Новые режимы требуют переустановки драйвера (`install-driver.cmd Release`).
 - Песочница/служба не имеет права `IDXGIOutput1::DuplicateOutput`; `stream.cmd` запускается как обычное пользовательское приложение.
 - INF/CAT проверены Release-сборкой; `ROOT\DISPLAY\0000` и дочерний монитор запущены без ошибок, перезагрузка и Test Mode не потребовались.

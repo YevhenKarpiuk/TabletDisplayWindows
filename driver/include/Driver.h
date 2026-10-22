@@ -159,22 +159,30 @@ namespace Microsoft
             void InitAdapter();
             void FinishInit(UINT ConnectorIndex);
             NTSTATUS CopyLatestFrame(
+                WDFFILEOBJECT fileObject,
                 UINT64 afterSequence,
                 void* output,
                 size_t outputBytes,
                 size_t* bytesWritten);
             NTSTATUS CopySharedFrame(
+                WDFFILEOBJECT fileObject,
                 UINT64 afterSequence,
                 UINT64 afterGeneration,
                 void* output,
                 size_t outputBytes,
                 size_t* bytesWritten);
-            NTSTATUS SetFrameTransport(UINT mode, UINT64 generation);
-            NTSTATUS SetMonitorConnection(WDFFILEOBJECT fileObject, bool connected);
+            NTSTATUS SetFrameTransport(WDFFILEOBJECT fileObject, UINT mode, UINT64 generation);
+            NTSTATUS SetMonitorConnection(
+                WDFFILEOBJECT fileObject,
+                bool connected,
+                UINT nativeWidth,
+                UINT nativeHeight,
+                UINT preferredDivisor);
             void ReleaseMonitorConnection(WDFFILEOBJECT fileObject) noexcept;
 
         protected:
             NTSTATUS CreateMonitorLocked();
+            bool IsMonitorLeaseOwner(WDFFILEOBJECT fileObject);
 
             WDFDEVICE m_WdfDevice;
             IDDCX_ADAPTER m_Adapter;

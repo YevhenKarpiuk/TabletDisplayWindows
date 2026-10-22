@@ -236,9 +236,6 @@ namespace tabletdisplay::host
     {
         Impl() : device(OpenFrameDevice())
         {
-            response.resize(
-                sizeof(tabletdisplay::ipc::FrameResponseHeader) +
-                tabletdisplay::ipc::kMaxFrameBytes);
         }
 
         ~Impl()
@@ -270,7 +267,7 @@ namespace tabletdisplay::host
             }
         }
 
-        void SetMonitorConnected(bool connected)
+        void SetMonitorConnected(bool connected, MonitorModeRequest modes = {})
         {
             const auto wasConnected = monitorConnected;
             if (!connected && wasConnected)
@@ -278,6 +275,19 @@ namespace tabletdisplay::host
 
             tabletdisplay::ipc::MonitorConnectionRequest request{};
             request.connected = connected ? 1U : 0U;
+            if (connected)
+            {
+                request.nativeWidth = modes.nativeWidth;
+                request.nativeHeight = modes.nativeHeight;
+                request.preferredDivisor = modes.preferredDivisor;
+                // Frames never exceed the tablet resolution, so the CPU fallback buffer can too.
+                const auto frameBytes = modes.nativeWidth != 0 && modes.nativeHeight != 0
+                    ? static_cast<std::size_t>(modes.nativeWidth) * modes.nativeHeight *
+                        tabletdisplay::ipc::kBytesPerPixel
+                    : static_cast<std::size_t>(tabletdisplay::ipc::kMaxFrameBytes);
+                response.resize(sizeof(tabletdisplay::ipc::FrameResponseHeader) +
+                    std::min<std::size_t>(frameBytes, tabletdisplay::ipc::kMaxFrameBytes));
+            }
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
             DWORD error{};
             for (;;)
@@ -324,6 +334,12 @@ namespace tabletdisplay::host
 
         [[nodiscard]] bool Capture(CapturedFrame& frame, std::uint32_t timeoutMs)
         {
+            if (response.empty())
+            {
+                response.resize(
+                    sizeof(tabletdisplay::ipc::FrameResponseHeader) +
+                    tabletdisplay::ipc::kMaxFrameBytes);
+            }
             const auto deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(timeoutMs);
             for (;;)
@@ -536,9 +552,9 @@ namespace tabletdisplay::host
         return m_impl->CaptureShared(frame, timeoutMs, true);
     }
 
-    void IddFrameCapture::SetMonitorConnected(bool connected)
+    void IddFrameCapture::SetMonitorConnected(bool connected, MonitorModeRequest modes)
     {
-        m_impl->SetMonitorConnected(connected);
+        m_impl->SetMonitorConnected(connected, modes);
     }
 
     void IddFrameCapture::SetSharedTransport(bool enabled, std::uint64_t generation)

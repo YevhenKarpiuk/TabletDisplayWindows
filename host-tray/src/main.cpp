@@ -17,16 +17,23 @@ namespace
     constexpr UINT_PTR kProcessTimer = 1;
     constexpr UINT kExitCommand = 1001;
     constexpr UINT kAutoStartCommand = 1002;
+    // kResolutionCommandBase + N selects the tablet resolution divided by N (1..4).
+    constexpr UINT kResolutionCommandBase = 1100;
+    constexpr DWORD kMaxResolutionDivisor = 4;
     constexpr wchar_t kWindowClass[] = L"TabletDisplayTrayWindow";
     constexpr wchar_t kMutexName[] = L"Local\\TabletDisplayTray-48B668E5-4AE8-4A35-A64F-328827B7ABDA";
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
     constexpr wchar_t kRunValueName[] = L"TabletDisplay";
+    constexpr wchar_t kSettingsKey[] = L"Software\\TabletDisplay";
+    constexpr wchar_t kResolutionDivisorValueName[] = L"ResolutionDivisor";
     constexpr GUID kSessionDisplayStatus{
         0x2b84c20e, 0xad23, 0x4ddf, { 0x93, 0xdb, 0x05, 0xff, 0xbd, 0x7e, 0xfc, 0xa5 }
     };
 
     NOTIFYICONDATAW g_trayIcon{};
     PROCESS_INFORMATION g_hostProcess{};
+    HANDLE g_hostStopEvent{};
+    std::wstring g_hostStopEventName;
     HANDLE g_instanceMutex{};
     HPOWERNOTIFY g_displayPowerNotification{};
     bool g_exiting{};
@@ -115,6 +122,32 @@ namespace
         return result == ERROR_SUCCESS;
     }
 
+    DWORD ResolutionDivisor() noexcept
+    {
+        DWORD value{};
+        DWORD valueBytes = sizeof(value);
+        const auto result = RegGetValueW(
+            HKEY_CURRENT_USER,
+            kSettingsKey,
+            kResolutionDivisorValueName,
+            RRF_RT_REG_DWORD,
+            nullptr,
+            &value,
+            &valueBytes);
+        return result == ERROR_SUCCESS && value >= 1 && value <= kMaxResolutionDivisor ? value : 1;
+    }
+
+    bool SetResolutionDivisor(DWORD divisor) noexcept
+    {
+        return RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            kSettingsKey,
+            kResolutionDivisorValueName,
+            REG_DWORD,
+            &divisor,
+            sizeof(divisor)) == ERROR_SUCCESS;
+    }
+
     void ReleaseTabletMouseButton() noexcept
     {
         INPUT input{};
@@ -153,20 +186,26 @@ namespace
 
     void StopHost() noexcept
     {
-        bool stoppedRunningHost{};
+        bool terminatedRunningHost{};
         if (g_hostProcess.hProcess)
         {
             if (WaitForSingleObject(g_hostProcess.hProcess, 0) == WAIT_TIMEOUT)
             {
-                stoppedRunningHost = true;
-                (void)TerminateProcess(g_hostProcess.hProcess, 0);
-                (void)WaitForSingleObject(g_hostProcess.hProcess, 5'000);
+                // A graceful stop lets the Host end the stream and detach the monitor itself.
+                if (g_hostStopEvent) (void)SetEvent(g_hostStopEvent);
+                if (WaitForSingleObject(g_hostProcess.hProcess, 4'000) == WAIT_TIMEOUT)
+                {
+                    terminatedRunningHost = true;
+                    (void)TerminateProcess(g_hostProcess.hProcess, 0);
+                    (void)WaitForSingleObject(g_hostProcess.hProcess, 5'000);
+                }
             }
             CloseHostHandles();
         }
-        ReleaseTabletMouseButton();
-        if (stoppedRunningHost)
+        if (terminatedRunningHost)
         {
+            // The terminated Host could not release the button or migrate taskbar buttons.
+            ReleaseTabletMouseButton();
             Sleep(100);
             RestoreTaskbarWindowRegistration();
             Sleep(250);
@@ -196,8 +235,17 @@ namespace
         if (std::filesystem::is_regular_file(bundledAdb))
             (void)SetEnvironmentVariableW(L"TABLETDISPLAY_ADB", bundledAdb.c_str());
 
+        if (!g_hostStopEvent)
+        {
+            g_hostStopEventName = L"Local\\TabletDisplayHostStop-" + std::to_wstring(GetCurrentProcessId());
+            g_hostStopEvent = CreateEventW(nullptr, TRUE, FALSE, g_hostStopEventName.c_str());
+            if (!g_hostStopEvent) return false;
+        }
+        (void)ResetEvent(g_hostStopEvent);
+
         std::wstring command = L"\"" + hostPath.wstring() +
-            L"\" --virtual-stream --reconnect --seconds 3600";
+            L"\" --virtual-stream --reconnect --seconds 0 --scale " +
+            std::to_wstring(ResolutionDivisor()) + L" --stop-event " + g_hostStopEventName;
         std::vector<wchar_t> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back(L'\0');
         STARTUPINFOW startup{};
@@ -249,6 +297,36 @@ namespace
         const auto exitText = ukrainian ? L"\u0412\u0438\u0445\u0456\u0434" : L"Exit";
         const auto autoStartFlags = MF_STRING |
             (IsAutoStartEnabled() ? MF_CHECKED : MF_UNCHECKED);
+
+        const auto resolutionMenu = CreatePopupMenu();
+        if (resolutionMenu)
+        {
+            const wchar_t* const ukrainianLabels[] = {
+                L"\u041e\u0440\u0438\u0433\u0456\u043d\u0430\u043b\u044c\u043d\u0430",
+                L"\u0423 2 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
+                L"\u0423 3 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
+                L"\u0423 4 \u0440\u0430\u0437\u0438 \u043c\u0435\u043d\u0448\u0430",
+            };
+            const wchar_t* const englishLabels[] = {
+                L"Native", L"2 times smaller", L"3 times smaller", L"4 times smaller",
+            };
+            const auto selected = ResolutionDivisor();
+            for (DWORD divisor = 1; divisor <= kMaxResolutionDivisor; ++divisor)
+            {
+                (void)AppendMenuW(
+                    resolutionMenu,
+                    MF_STRING | (divisor == selected ? MF_CHECKED : MF_UNCHECKED),
+                    kResolutionCommandBase + divisor,
+                    (ukrainian ? ukrainianLabels : englishLabels)[divisor - 1]);
+            }
+            (void)AppendMenuW(
+                menu,
+                MF_POPUP,
+                reinterpret_cast<UINT_PTR>(resolutionMenu),
+                ukrainian
+                    ? L"\u0420\u043e\u0437\u0434\u0456\u043b\u044c\u043d\u0430 \u0437\u0434\u0430\u0442\u043d\u0456\u0441\u0442\u044c"
+                    : L"Resolution");
+        }
         (void)AppendMenuW(menu, autoStartFlags, kAutoStartCommand, autoStartText);
         (void)AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         (void)AppendMenuW(menu, MF_STRING, kExitCommand, exitText);
@@ -335,6 +413,18 @@ namespace
                 }
                 return 0;
             }
+            if (LOWORD(wParam) > kResolutionCommandBase &&
+                LOWORD(wParam) <= kResolutionCommandBase + kMaxResolutionDivisor)
+            {
+                const DWORD divisor = LOWORD(wParam) - kResolutionCommandBase;
+                if (divisor != ResolutionDivisor() && SetResolutionDivisor(divisor))
+                {
+                    // The Host chooses the monitor mode when it connects, so restart it.
+                    StopHost();
+                    if (g_displayPoweredOn) (void)StartHost(window);
+                }
+                return 0;
+            }
             if (LOWORD(wParam) == kExitCommand)
             {
                 DestroyWindow(window);
@@ -394,6 +484,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    if (g_hostStopEvent) CloseHandle(g_hostStopEvent);
     CloseHandle(g_instanceMutex);
     return static_cast<int>(message.wParam);
 }

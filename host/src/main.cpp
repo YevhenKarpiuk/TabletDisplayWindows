@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "DesktopCapture.h"
+#include "display/DisplayModes.h"
 #include "IddFrameCapture.h"
 #include "MediaFoundationH264Encoder.h"
 #include "protocol/Protocol.h"
@@ -23,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <span>
@@ -40,6 +42,21 @@ namespace
     constexpr std::uint64_t kCapabilities = 0xFF;
     constexpr std::uint64_t kRequiredCapabilities = 0xE1;
     constexpr std::uint64_t kAvcProfiles = 0x0E;
+    constexpr std::uint16_t kHeartbeatIntervalMs = 1'000;
+    constexpr std::uint16_t kIdleTimeoutMs = 5'000;
+    constexpr std::wstring_view kTabletDisplayDeviceString = L"TabletDisplay Virtual Display";
+
+    // ERROR codes and severities from doc/PROTOCOL.md section 5.9.
+    constexpr std::uint16_t kErrorMalformedHeader = 1;
+    constexpr std::uint16_t kErrorUnsupportedVersion = 2;
+    constexpr std::uint16_t kErrorUnknownCriticalType = 3;
+    constexpr std::uint16_t kErrorPayloadTooLarge = 4;
+    constexpr std::uint16_t kErrorInvalidPayload = 5;
+    constexpr std::uint16_t kErrorUnexpectedMessage = 6;
+    constexpr std::uint16_t kErrorInternal = 8;
+    constexpr std::uint16_t kErrorTimeout = 9;
+    constexpr std::uint16_t kErrorSequenceGap = 10;
+    constexpr std::uint8_t kSeverityFatal = 3;
 
     enum class RunMode
     {
@@ -61,6 +78,96 @@ namespace
         std::string serial;
         std::string state;
         std::string description;
+    };
+
+    // The peer violated the protocol; reported to Android with the given ERROR code.
+    class ProtocolFailure final : public std::runtime_error
+    {
+    public:
+        ProtocolFailure(std::uint16_t code, const std::string& message)
+            : std::runtime_error(message), m_code(code)
+        {
+        }
+
+        [[nodiscard]] std::uint16_t code() const noexcept { return m_code; }
+
+    private:
+        std::uint16_t m_code;
+    };
+
+    // The TCP connection is gone, so there is nobody to report an ERROR to.
+    class TransportFailure final : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    class PeerReportedFailure final : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    class NoDeviceFailure final : public std::runtime_error
+    {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+
+    HANDLE g_stopEvent{};
+    std::atomic<std::uint64_t> g_lastProgressMs{ GetTickCount64() };
+
+    [[nodiscard]] bool StopRequested() noexcept
+    {
+        return g_stopEvent != nullptr && WaitForSingleObject(g_stopEvent, 0) == WAIT_OBJECT_0;
+    }
+
+    // Returns true when the tray asked the Host to stop during the wait.
+    bool WaitUnlessStopped(std::chrono::milliseconds duration)
+    {
+        if (g_stopEvent == nullptr)
+        {
+            std::this_thread::sleep_for(duration);
+            return false;
+        }
+        return WaitForSingleObject(g_stopEvent, static_cast<DWORD>(duration.count())) == WAIT_OBJECT_0;
+    }
+
+    void ReportProgress() noexcept
+    {
+        g_lastProgressMs = GetTickCount64();
+    }
+
+    // A hung adb, driver IOCTL or Media Foundation call cannot be cancelled from inside the
+    // process. The tray restarts a Host that exits, so a stalled Host terminates itself.
+    class ProgressWatchdog
+    {
+    public:
+        explicit ProgressWatchdog(std::chrono::seconds limit)
+            : m_thread([limit](std::stop_token stopToken)
+            {
+                std::mutex mutex;
+                std::condition_variable_any wake;
+                ReportProgress();
+                std::unique_lock lock(mutex);
+                while (!wake.wait_for(lock, stopToken, std::chrono::seconds(1), [] { return false; }))
+                {
+                    if (stopToken.stop_requested()) return;
+                    const auto stalledMs = GetTickCount64() - g_lastProgressMs.load();
+                    if (stalledMs > static_cast<std::uint64_t>(limit.count()) * 1'000U)
+                    {
+                        std::cerr << "TabletDisplayHost: no progress for " << stalledMs / 1'000U
+                            << " s; terminating so the tray can restart the Host.\n";
+                        std::cerr.flush();
+                        TerminateProcess(GetCurrentProcess(), 3);
+                    }
+                }
+            })
+        {
+        }
+
+    private:
+        std::jthread m_thread;
     };
 
     class SocketHandle
@@ -132,7 +239,7 @@ namespace
         static_assert(std::is_unsigned_v<T>);
         if (offset > bytes.size() || sizeof(T) > bytes.size() - offset)
         {
-            throw std::runtime_error("Truncated protocol payload");
+            throw ProtocolFailure(kErrorInvalidPayload, "Truncated protocol payload");
         }
         T value{};
         for (std::size_t index = 0; index < sizeof(T); ++index)
@@ -176,69 +283,73 @@ namespace
         return output;
     }
 
+    struct TabletDisplayMode
+    {
+        std::wstring deviceName;
+        DEVMODEW mode{};
+    };
+
+    [[nodiscard]] std::optional<TabletDisplayMode> FindTabletDisplayMode()
+    {
+        DISPLAY_DEVICEW device{};
+        device.cb = sizeof(device);
+        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
+        {
+            if (std::wstring_view(device.DeviceString) == kTabletDisplayDeviceString &&
+                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
+            {
+                TabletDisplayMode result{ device.DeviceName, {} };
+                result.mode.dmSize = sizeof(result.mode);
+                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &result.mode, 0))
+                    throw std::runtime_error("Cannot query the TabletDisplay mode");
+                return result;
+            }
+            device = {};
+            device.cb = sizeof(device);
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] TabletDisplayMode RequireTabletDisplayMode()
+    {
+        auto display = FindTabletDisplayMode();
+        if (!display) throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+        return std::move(*display);
+    }
+
     void ConfigureTabletDisplayMode(
         std::uint32_t width,
         std::uint32_t height,
         std::uint32_t frequency)
     {
-        DISPLAY_DEVICEW device{};
-        device.cb = sizeof(device);
-        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
-        {
-            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display" &&
-                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
-            {
-                DEVMODEW mode{};
-                mode.dmSize = sizeof(mode);
-                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0))
-                    throw std::runtime_error("Cannot query the TabletDisplay mode");
-                if (mode.dmPelsWidth == width && mode.dmPelsHeight == height &&
-                    mode.dmDisplayFrequency == frequency)
-                    return;
+        auto display = RequireTabletDisplayMode();
+        auto& mode = display.mode;
+        if (mode.dmPelsWidth == width && mode.dmPelsHeight == height &&
+            mode.dmDisplayFrequency == frequency)
+            return;
 
-                mode.dmPelsWidth = width;
-                mode.dmPelsHeight = height;
-                mode.dmDisplayFrequency = frequency;
-                mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-                const auto testResult = ChangeDisplaySettingsExW(
-                    device.DeviceName, &mode, nullptr, CDS_TEST, nullptr);
-                if (testResult != DISP_CHANGE_SUCCESSFUL)
-                    throw std::runtime_error("Windows rejected the requested TabletDisplay mode");
-                const auto applyResult = ChangeDisplaySettingsExW(
-                    device.DeviceName, &mode, nullptr, CDS_UPDATEREGISTRY, nullptr);
-                if (applyResult != DISP_CHANGE_SUCCESSFUL)
-                    throw std::runtime_error("Windows could not apply the requested TabletDisplay mode");
-                std::cout << "Windows display mode: " << width << 'x' << height
-                    << " @ " << frequency << " Hz\n";
-                return;
-            }
-            device = {};
-            device.cb = sizeof(device);
-        }
-        throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+        mode.dmPelsWidth = width;
+        mode.dmPelsHeight = height;
+        mode.dmDisplayFrequency = frequency;
+        mode.dmFields |= DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+        const auto testResult = ChangeDisplaySettingsExW(
+            display.deviceName.c_str(), &mode, nullptr, CDS_TEST, nullptr);
+        if (testResult != DISP_CHANGE_SUCCESSFUL)
+            throw std::runtime_error("Windows rejected the requested TabletDisplay mode");
+        const auto applyResult = ChangeDisplaySettingsExW(
+            display.deviceName.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY, nullptr);
+        if (applyResult != DISP_CHANGE_SUCCESSFUL)
+            throw std::runtime_error("Windows could not apply the requested TabletDisplay mode");
+        std::cout << "Windows display mode: " << width << 'x' << height
+            << " @ " << frequency << " Hz\n";
     }
 
     [[nodiscard]] DWORD TabletDisplayOrientation()
     {
-        DISPLAY_DEVICEW device{};
-        device.cb = sizeof(device);
-        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
-        {
-            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display" &&
-                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
-            {
-                DEVMODEW mode{};
-                mode.dmSize = sizeof(mode);
-                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0))
-                    throw std::runtime_error("Cannot query the TabletDisplay orientation");
-                if (mode.dmDisplayOrientation > DMDO_270)
-                    throw std::runtime_error("Windows reported an invalid TabletDisplay orientation");
-                return mode.dmDisplayOrientation;
-            }
-            device = {};
-            device.cb = sizeof(device);
-        }
-        throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+        const auto display = RequireTabletDisplayMode();
+        if (display.mode.dmDisplayOrientation > DMDO_270)
+            throw std::runtime_error("Windows reported an invalid TabletDisplay orientation");
+        return display.mode.dmDisplayOrientation;
     }
 
     [[nodiscard]] DWORD WaitForTabletDisplayOrientation()
@@ -269,23 +380,13 @@ namespace
 
     [[nodiscard]] DisplayBounds FindTabletDisplayBounds()
     {
-        DISPLAY_DEVICEW device{};
-        device.cb = sizeof(device);
-        for (DWORD index = 0; EnumDisplayDevicesW(nullptr, index, &device, 0); ++index)
-        {
-            if (std::wstring_view(device.DeviceString) == L"TabletDisplay Virtual Display" &&
-                (device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
-            {
-                DEVMODEW mode{};
-                mode.dmSize = sizeof(mode);
-                if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0))
-                    throw std::runtime_error("Cannot query the TabletDisplay position");
-                return { mode.dmPosition.x, mode.dmPosition.y, mode.dmPelsWidth, mode.dmPelsHeight };
-            }
-            device = {};
-            device.cb = sizeof(device);
-        }
-        throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
+        const auto display = RequireTabletDisplayMode();
+        return {
+            display.mode.dmPosition.x,
+            display.mode.dmPosition.y,
+            display.mode.dmPelsWidth,
+            display.mode.dmPelsHeight
+        };
     }
 
     void ReleaseTabletMouseButton(std::atomic_bool& primaryButtonDown) noexcept
@@ -319,13 +420,26 @@ namespace
 
     void InjectTouch(
         std::span<const std::uint8_t> payload,
-        const DisplayBounds& display,
+        DisplayBounds& display,
         std::atomic_bool& primaryButtonDown)
     {
         if (ReadLe<std::uint32_t>(payload, 0) != 1 || ReadLe<std::uint32_t>(payload, 4) != 0)
-            throw std::runtime_error("TOUCH targets an unexpected stream or pointer");
+            throw ProtocolFailure(kErrorInvalidPayload, "TOUCH targets an unexpected stream or pointer");
 
         const auto action = payload[8];
+        if (action < 1 || action > 4) throw ProtocolFailure(kErrorInvalidPayload, "TOUCH has an unknown action");
+        if (action == 1)
+        {
+            // The user may have rearranged monitors since the stream started.
+            try
+            {
+                display = FindTabletDisplayBounds();
+            }
+            catch (const std::runtime_error&)
+            {
+            }
+        }
+
         const auto normalizedX = ReadLe<std::uint16_t>(payload, 10);
         const auto normalizedY = ReadLe<std::uint16_t>(payload, 12);
         const auto virtualLeft = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -349,9 +463,9 @@ namespace
         input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         if (action == 1) input.mi.dwFlags |= MOUSEEVENTF_LEFTDOWN;
         else if (action == 3 || action == 4) input.mi.dwFlags |= MOUSEEVENTF_LEFTUP;
-        else if (action != 2) throw std::runtime_error("TOUCH has an unknown action");
-        if (SendInput(1, &input, sizeof(input)) != 1)
-            throw std::runtime_error("Windows rejected touch mouse input");
+        // UIPI blocks input to elevated windows and the secure desktop (UAC, lock screen).
+        // Losing such an event must not drop the whole video session.
+        if (SendInput(1, &input, sizeof(input)) != 1) return;
         if (action == 1) primaryButtonDown = true;
         else if (action == 3 || action == 4) primaryButtonDown = false;
     }
@@ -396,7 +510,8 @@ namespace
 
     [[nodiscard]] ProcessResult RunProcess(
         const std::filesystem::path& executable,
-        const std::wstring& arguments)
+        const std::wstring& arguments,
+        std::chrono::milliseconds timeout = std::chrono::seconds(20))
     {
         SECURITY_ATTRIBUTES security{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
         HANDLE readPipe{};
@@ -425,19 +540,41 @@ namespace
             throw std::runtime_error("Cannot start adb.exe");
         }
 
+        // The adb server started by the first command inherits the pipe and keeps it open,
+        // so the output is read only while the adb client process itself is running.
         std::string output;
         std::array<char, 4096> buffer{};
-        DWORD count{};
-        while (ReadFile(readPipe, buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr) && count != 0)
+        const auto drain = [&]
         {
-            output.append(buffer.data(), count);
+            DWORD available{};
+            while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available != 0)
+            {
+                DWORD count{};
+                const auto request = std::min<DWORD>(available, static_cast<DWORD>(buffer.size()));
+                if (!ReadFile(readPipe, buffer.data(), request, &count, nullptr) || count == 0) return;
+                output.append(buffer.data(), count);
+            }
+        };
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        bool finished{};
+        while (!finished)
+        {
+            finished = WaitForSingleObject(process.hProcess, 50) == WAIT_OBJECT_0;
+            drain();
+            if (!finished && std::chrono::steady_clock::now() >= deadline) break;
         }
-        WaitForSingleObject(process.hProcess, INFINITE);
+        if (!finished)
+        {
+            (void)TerminateProcess(process.hProcess, 1);
+            (void)WaitForSingleObject(process.hProcess, 1'000);
+        }
         DWORD exitCode{};
         GetExitCodeProcess(process.hProcess, &exitCode);
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
         CloseHandle(readPipe);
+        if (!finished) throw std::runtime_error("adb.exe did not finish in time");
+        ReportProgress();
         return { exitCode, std::move(output) };
     }
 
@@ -469,8 +606,8 @@ namespace
             {
                 return device.serial == requested;
             });
-            if (match == devices.end()) throw std::runtime_error("Requested ADB device was not found");
-            if (match->state != "device") throw std::runtime_error("Requested ADB device is " + match->state);
+            if (match == devices.end()) throw NoDeviceFailure("Requested ADB device was not found");
+            if (match->state != "device") throw NoDeviceFailure("Requested ADB device is " + match->state);
             return match->serial;
         }
         std::vector<std::string> ready;
@@ -478,7 +615,7 @@ namespace
         {
             if (device.state == "device") ready.push_back(device.serial);
         }
-        if (ready.empty()) throw std::runtime_error("No authorized ADB device is connected");
+        if (ready.empty()) throw NoDeviceFailure("No authorized ADB device is connected");
         if (ready.size() != 1) throw std::runtime_error("Multiple ADB devices are ready; use --serial");
         return ready.front();
     }
@@ -529,7 +666,7 @@ namespace
             {
                 return socket;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            if (WaitUnlessStopped(std::chrono::milliseconds(250))) break;
         }
         throw std::runtime_error("Cannot connect to Android on 127.0.0.1:27183");
     }
@@ -547,9 +684,22 @@ namespace
                 reinterpret_cast<const char*>(bytes.data() + offset),
                 static_cast<int>(remaining),
                 0);
-            if (sent == SOCKET_ERROR || sent == 0) throw std::runtime_error("TCP send failed");
+            if (sent == SOCKET_ERROR || sent == 0) throw TransportFailure("TCP send failed");
             offset += static_cast<std::size_t>(sent);
         }
+    }
+
+    [[nodiscard]] Message MakeMessage(
+        MessageType type,
+        std::uint64_t sequence,
+        std::vector<std::uint8_t> payload,
+        std::uint16_t flags = Critical)
+    {
+        return {
+            { static_cast<std::uint16_t>(type), flags,
+              static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
+            std::move(payload)
+        };
     }
 
     [[nodiscard]] Message MakeHello(std::uint64_t nonce)
@@ -561,13 +711,9 @@ namespace
         AppendLe(payload, nonce);
         AppendLe(payload, kCapabilities);
         AppendLe(payload, kMaxPayloadSize);
-        AppendLe(payload, static_cast<std::uint16_t>(1'000));
-        AppendLe(payload, static_cast<std::uint16_t>(5'000));
-        return {
-            { static_cast<std::uint16_t>(MessageType::Hello), Critical,
-              static_cast<std::uint32_t>(payload.size()), 1, NowUs() },
-            std::move(payload)
-        };
+        AppendLe(payload, kHeartbeatIntervalMs);
+        AppendLe(payload, kIdleTimeoutMs);
+        return MakeMessage(MessageType::Hello, 1, std::move(payload));
     }
 
     [[nodiscard]] Message MakePing(std::uint64_t sequence, std::uint64_t token)
@@ -576,11 +722,49 @@ namespace
         payload.reserve(16);
         AppendLe(payload, token);
         AppendLe(payload, NowUs());
-        return {
-            { static_cast<std::uint16_t>(MessageType::Ping), Critical,
-              static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
-            std::move(payload)
-        };
+        return MakeMessage(MessageType::Ping, sequence, std::move(payload));
+    }
+
+    [[nodiscard]] Message MakePong(std::uint64_t sequence, std::span<const std::uint8_t> ping)
+    {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(24);
+        AppendLe(payload, ReadLe<std::uint64_t>(ping, 0));
+        AppendLe(payload, ReadLe<std::uint64_t>(ping, 8));
+        AppendLe(payload, NowUs());
+        return MakeMessage(MessageType::Pong, sequence, std::move(payload));
+    }
+
+    [[nodiscard]] Message MakeError(
+        std::uint64_t sequence,
+        std::uint16_t code,
+        std::string_view text)
+    {
+        // Diagnostic text is plain ASCII, which is always valid UTF-8.
+        std::string ascii;
+        for (const auto character : text.substr(0, kMaxErrorTextSize))
+        {
+            ascii.push_back(character >= 0x20 && character < 0x7F ? character : '?');
+        }
+        std::vector<std::uint8_t> payload;
+        payload.reserve(20U + ascii.size());
+        AppendLe(payload, code);
+        payload.push_back(kSeverityFatal);
+        payload.push_back(0);
+        AppendLe(payload, static_cast<std::uint16_t>(0)); // offending message type.
+        AppendLe(payload, static_cast<std::uint16_t>(0));
+        AppendLe(payload, static_cast<std::uint64_t>(0)); // offending sequence.
+        AppendLe(payload, static_cast<std::uint16_t>(ascii.size()));
+        AppendLe(payload, static_cast<std::uint16_t>(0));
+        payload.insert(payload.end(), ascii.begin(), ascii.end());
+        return MakeMessage(MessageType::Error, sequence, std::move(payload));
+    }
+
+    [[nodiscard]] std::string ErrorText(std::span<const std::uint8_t> payload)
+    {
+        const auto length = ReadLe<std::uint16_t>(payload, 16);
+        if (payload.size() < 20U + length) return {};
+        return std::string(payload.begin() + 20, payload.begin() + 20 + length);
     }
 
     [[nodiscard]] Message MakeVideoConfig(
@@ -607,11 +791,7 @@ namespace
         AppendLe(payload, bitrate);
         AppendLe(payload, static_cast<std::uint32_t>(codecSpecificData.size()));
         payload.insert(payload.end(), codecSpecificData.begin(), codecSpecificData.end());
-        return {
-            { static_cast<std::uint16_t>(MessageType::VideoConfig), Critical,
-              static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
-            std::move(payload)
-        };
+        return MakeMessage(MessageType::VideoConfig, sequence, std::move(payload));
     }
 
     [[nodiscard]] Message MakeVideoFrame(
@@ -636,11 +816,7 @@ namespace
         if (keyFrame) flags = static_cast<std::uint16_t>(flags | KeyFrame);
         if (discontinuity) flags = static_cast<std::uint16_t>(flags | Discontinuity);
         if (endOfStream) flags = static_cast<std::uint16_t>(flags | EndOfStream);
-        return {
-            { static_cast<std::uint16_t>(MessageType::VideoFrame), flags,
-              static_cast<std::uint32_t>(payload.size()), sequence, NowUs() },
-            std::move(payload)
-        };
+        return MakeMessage(MessageType::VideoFrame, sequence, std::move(payload), flags);
     }
 
     void SendMessage(SOCKET socket, const Message& message)
@@ -648,7 +824,98 @@ namespace
         SendAll(socket, EncodeMessage(message.header, message.payload));
     }
 
-    [[nodiscard]] std::uint64_t PerformHandshake(SOCKET socket)
+    // Serializes Windows-to-Android messages from the streaming and receiving threads and
+    // assigns the direction's sequence numbers.
+    class ProtocolSender
+    {
+    public:
+        ProtocolSender(SOCKET socket, std::uint64_t nextSequence) noexcept
+            : m_socket(socket), m_nextSequence(nextSequence)
+        {
+        }
+
+        template<typename MakeMessageForSequence>
+        void Send(MakeMessageForSequence&& make)
+        {
+            std::lock_guard lock(m_mutex);
+            SendMessage(m_socket, make(m_nextSequence++));
+        }
+
+    private:
+        SOCKET m_socket;
+        std::mutex m_mutex;
+        std::uint64_t m_nextSequence;
+    };
+
+    [[nodiscard]] std::uint16_t ErrorCodeFor(const std::exception& exception) noexcept
+    {
+        if (const auto* failure = dynamic_cast<const ProtocolFailure*>(&exception)) return failure->code();
+        if (const auto* failure = dynamic_cast<const ProtocolException*>(&exception))
+        {
+            switch (failure->kind())
+            {
+            case ProtocolErrorKind::BadMagic:
+            case ProtocolErrorKind::InvalidHeader:
+                return 0; // The header could not be parsed safely: close without ERROR.
+            case ProtocolErrorKind::InvalidFlags: return kErrorMalformedHeader;
+            case ProtocolErrorKind::UnsupportedVersion: return kErrorUnsupportedVersion;
+            case ProtocolErrorKind::UnknownCriticalType: return kErrorUnknownCriticalType;
+            case ProtocolErrorKind::PayloadTooLarge: return kErrorPayloadTooLarge;
+            case ProtocolErrorKind::InvalidPayload: return kErrorInvalidPayload;
+            case ProtocolErrorKind::SequenceGap: return kErrorSequenceGap;
+            }
+        }
+        if (dynamic_cast<const TransportFailure*>(&exception) != nullptr ||
+            dynamic_cast<const PeerReportedFailure*>(&exception) != nullptr)
+            return 0;
+        return kErrorInternal;
+    }
+
+    // Best effort: tells Android why the session ends, as protocol section 5.9 requires.
+    void SendFatalError(ProtocolSender& sender, std::exception_ptr failure) noexcept
+    {
+        try
+        {
+            std::rethrow_exception(failure);
+        }
+        catch (const std::exception& exception)
+        {
+            const auto code = ErrorCodeFor(exception);
+            if (code == 0) return;
+            try
+            {
+                sender.Send([&](std::uint64_t sequence)
+                {
+                    return MakeError(sequence, code, exception.what());
+                });
+            }
+            catch (...)
+            {
+            }
+        }
+        catch (...)
+        {
+        }
+    }
+
+    // DISPLAY_INFO: the panel resolution in the current tablet orientation and the
+    // largest AVC frame the tablet decoder accepts.
+    struct AndroidDisplay
+    {
+        std::uint32_t width{};
+        std::uint32_t height{};
+        std::uint32_t maxAvcWidth{};
+        std::uint32_t maxAvcHeight{};
+    };
+
+    struct HandshakeResult
+    {
+        std::uint64_t nextSequence{};
+        IncrementalDecoder decoder;
+        AndroidDisplay display;
+    };
+
+    [[nodiscard]] HandshakeResult PerformHandshake(SOCKET socket)
     {
         const auto nonce = RandomNonce();
         SendMessage(socket, MakeHello(nonce));
@@ -657,14 +924,15 @@ namespace
         bool ackReceived{};
         bool displayReceived{};
         bool pingSent{};
+        AndroidDisplay display;
         const auto pingToken = RandomNonce();
 
         while (true)
         {
             const auto count = recv(socket, reinterpret_cast<char*>(buffer.data()),
                 static_cast<int>(buffer.size()), 0);
-            if (count == 0) throw std::runtime_error("Android closed the handshake connection");
-            if (count == SOCKET_ERROR) throw std::runtime_error("TCP receive timed out or failed");
+            if (count == 0) throw TransportFailure("Android closed the handshake connection");
+            if (count == SOCKET_ERROR) throw TransportFailure("TCP receive timed out or failed");
             for (const auto& message : decoder.Feed(
                 std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(count))))
             {
@@ -672,33 +940,46 @@ namespace
                 if (type == MessageType::HelloAck && !ackReceived)
                 {
                     const auto status = ReadLe<std::uint16_t>(message.payload, 0);
-                    if (status != 0) throw std::runtime_error("Android rejected HELLO, status " + std::to_string(status));
+                    if (status != 0) throw PeerReportedFailure("Android rejected HELLO, status " + std::to_string(status));
                     if (ReadLe<std::uint64_t>(message.payload, 8) != nonce)
-                        throw std::runtime_error("HELLO_ACK nonce mismatch");
+                        throw ProtocolFailure(kErrorInvalidPayload, "HELLO_ACK nonce mismatch");
                     const auto capabilities = ReadLe<std::uint64_t>(message.payload, 24);
                     if ((capabilities & kRequiredCapabilities) != kRequiredCapabilities ||
                         (capabilities & kAvcProfiles) == 0)
-                        throw std::runtime_error("HELLO_ACK is missing an MVP capability");
+                        throw ProtocolFailure(kErrorInvalidPayload, "HELLO_ACK is missing an MVP capability");
                     ackReceived = true;
                 }
                 else if (type == MessageType::DisplayInfo && ackReceived && !displayReceived)
                 {
+                    display = {
+                        ReadLe<std::uint32_t>(message.payload, 0),
+                        ReadLe<std::uint32_t>(message.payload, 4),
+                        ReadLe<std::uint32_t>(message.payload, 16),
+                        ReadLe<std::uint32_t>(message.payload, 20)
+                    };
                     std::cout
-                        << "Android display: " << ReadLe<std::uint32_t>(message.payload, 0)
-                        << 'x' << ReadLe<std::uint32_t>(message.payload, 4)
+                        << "Android display: " << display.width << 'x' << display.height
+                        << ", decoder up to " << display.maxAvcWidth << 'x' << display.maxAvcHeight
                         << " @ " << ReadLe<std::uint32_t>(message.payload, 24) << " FPS\n";
                     displayReceived = true;
                 }
                 else if (type == MessageType::Pong && pingSent)
                 {
                     if (ReadLe<std::uint64_t>(message.payload, 0) != pingToken)
-                        throw std::runtime_error("PONG token mismatch");
+                        throw ProtocolFailure(kErrorInvalidPayload, "PONG token mismatch");
                     std::cout << "Protocol handshake and PING/PONG succeeded.\n";
-                    return 3;
+                    ReportProgress();
+                    return { 3, std::move(decoder), display };
+                }
+                else if (type == MessageType::Error)
+                {
+                    throw PeerReportedFailure("Android reported an error: " + ErrorText(message.payload));
                 }
                 else
                 {
-                    throw std::runtime_error("Unexpected Android-to-Windows message during handshake");
+                    throw ProtocolFailure(
+                        kErrorUnexpectedMessage,
+                        "Unexpected Android-to-Windows message during handshake");
                 }
             }
             if (ackReceived && displayReceived && !pingSent)
@@ -709,27 +990,120 @@ namespace
         }
     }
 
-    void RunSyntheticDemo(SOCKET socket, std::uint64_t nextSequence)
+    // Sends VIDEO_CONFIG before the first access unit and numbers VIDEO_FRAME messages.
+    class VideoStreamWriter
+    {
+    public:
+        VideoStreamWriter(
+            ProtocolSender& sender,
+            const tabletdisplay::host::MediaFoundationH264Encoder& encoder,
+            std::uint16_t width,
+            std::uint16_t height,
+            std::uint16_t fps,
+            std::uint32_t bitrate) noexcept
+            : m_sender(sender),
+              m_encoder(encoder),
+              m_width(width),
+              m_height(height),
+              m_fps(fps),
+              m_bitrate(bitrate)
+        {
+        }
+
+        void Send(const tabletdisplay::host::EncodedAccessUnit& encoded)
+        {
+            if (!m_configSent)
+            {
+                const auto* config = m_encoder.CodecConfig();
+                if (config == nullptr) throw std::runtime_error("H.264 encoder produced no SPS/PPS");
+                m_sender.Send([&](std::uint64_t sequence)
+                {
+                    return MakeVideoConfig(
+                        sequence, m_width, m_height, m_fps,
+                        config->profileIdc == 0 ? 66 : config->profileIdc,
+                        config->levelIdc == 0 ? 40 : config->levelIdc,
+                        m_bitrate,
+                        config->annexB);
+                });
+                m_configSent = true;
+            }
+            if (m_nextFrameId == 1 && !encoded.keyFrame)
+                throw std::runtime_error("H.264 encoder did not produce an initial IDR");
+            // Protocol section 5.5: the first IDR after VIDEO_CONFIG or REQUEST_KEYFRAME
+            // carries DISCONTINUITY so Android flushes its decoder.
+            const bool discontinuity = encoded.keyFrame && (m_nextFrameId == 1 || m_discontinuityPending);
+            if (encoded.keyFrame) m_discontinuityPending = false;
+            m_sender.Send([&](std::uint64_t sequence)
+            {
+                return MakeVideoFrame(
+                    sequence,
+                    m_nextFrameId,
+                    encoded.presentationTimeUs,
+                    encoded.bytes,
+                    encoded.keyFrame,
+                    discontinuity);
+            });
+            ++m_nextFrameId;
+            m_bytesSent += encoded.bytes.size();
+            ReportProgress();
+        }
+
+        void RequestDiscontinuity() noexcept
+        {
+            m_discontinuityPending = true;
+        }
+
+        void SendEndOfStream(std::uint64_t presentationTimeUs)
+        {
+            if (!m_configSent) throw std::runtime_error("H.264 encoder produced no frames");
+            m_sender.Send([&](std::uint64_t sequence)
+            {
+                return MakeVideoFrame(sequence, m_nextFrameId, presentationTimeUs, {}, false, false, true);
+            });
+        }
+
+        [[nodiscard]] std::uint64_t FramesSent() const noexcept { return m_nextFrameId - 1; }
+        [[nodiscard]] std::uint64_t BytesSent() const noexcept { return m_bytesSent; }
+
+    private:
+        ProtocolSender& m_sender;
+        const tabletdisplay::host::MediaFoundationH264Encoder& m_encoder;
+        std::uint16_t m_width;
+        std::uint16_t m_height;
+        std::uint16_t m_fps;
+        std::uint32_t m_bitrate;
+        std::uint64_t m_nextFrameId{ 1 };
+        std::uint64_t m_bytesSent{};
+        bool m_configSent{};
+        bool m_discontinuityPending{};
+    };
+
+    void RunSyntheticDemo(ProtocolSender& sender)
     {
         const auto stream = tabletdisplay::video::BuildSyntheticColorBars();
         std::cout
             << "Synthetic H.264: " << stream.width << 'x' << stream.height
             << ", IDR " << stream.idrAccessUnit.size() << " bytes\n";
-        SendMessage(socket, MakeVideoConfig(
-            nextSequence++, stream.width, stream.height, stream.fps,
-            stream.profileIdc, stream.levelIdc, 5'000'000, stream.codecSpecificData));
-        SendMessage(socket, MakeVideoFrame(
-            nextSequence++, 1, 0, stream.idrAccessUnit, true, true));
+        sender.Send([&](std::uint64_t sequence)
+        {
+            return MakeVideoConfig(
+                sequence, stream.width, stream.height, stream.fps,
+                stream.profileIdc, stream.levelIdc, 5'000'000, stream.codecSpecificData);
+        });
+        sender.Send([&](std::uint64_t sequence)
+        {
+            return MakeVideoFrame(sequence, 1, 0, stream.idrAccessUnit, true, true);
+        });
         std::cout << "Color bars sent; keeping the demo session alive for 6 seconds.\n";
         for (unsigned second = 0; second < 6; ++second)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            SendMessage(socket, MakePing(nextSequence++, RandomNonce()));
+            if (WaitUnlessStopped(std::chrono::seconds(1))) break;
+            sender.Send([](std::uint64_t sequence) { return MakePing(sequence, RandomNonce()); });
         }
         std::cout << "Synthetic video demo completed.\n";
     }
 
-    void RunEncoderDemo(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
+    void RunEncoderDemo(ProtocolSender& sender, unsigned seconds)
     {
         constexpr std::uint16_t width = 1280;
         constexpr std::uint16_t height = 800;
@@ -738,43 +1112,16 @@ namespace
         tabletdisplay::host::MediaFoundationH264Encoder encoder({
             width, height, fps, bitrate, false });
         std::cout << "Media Foundation encoder demo: " << encoder.Name() << '\n';
+        VideoStreamWriter writer(sender, encoder, width, height, fps, bitrate);
 
         std::vector<std::uint8_t> nv12(
             static_cast<std::size_t>(width) * height * 3U / 2U,
             128);
-        std::uint64_t frameId = 1;
-        std::uint64_t bytesSent{};
-        bool configSent{};
-        bool firstFrame = true;
-        const auto sendEncoded = [&](const tabletdisplay::host::EncodedAccessUnit& encoded)
-        {
-            if (!configSent)
-            {
-                const auto* config = encoder.CodecConfig();
-                if (config == nullptr) throw std::runtime_error("H.264 encoder produced no SPS/PPS");
-                SendMessage(socket, MakeVideoConfig(
-                    nextSequence++, width, height, fps,
-                    config->profileIdc == 0 ? 66 : config->profileIdc,
-                    config->levelIdc == 0 ? 40 : config->levelIdc,
-                    bitrate,
-                    config->annexB));
-                configSent = true;
-            }
-            SendMessage(socket, MakeVideoFrame(
-                nextSequence++,
-                frameId++,
-                encoded.presentationTimeUs,
-                encoded.bytes,
-                encoded.keyFrame,
-                firstFrame));
-            bytesSent += encoded.bytes.size();
-            firstFrame = false;
-        };
-
         const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
         auto nextFrameTime = std::chrono::steady_clock::now();
         const auto frameDuration = std::chrono::nanoseconds(1'000'000'000ULL / fps);
-        for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+        std::uint64_t frameIndex = 0;
+        for (; frameIndex < frameCount && !StopRequested(); ++frameIndex)
         {
             auto* yPlane = nv12.data();
             for (std::uint32_t y = 0; y < height; ++y)
@@ -794,26 +1141,18 @@ namespace
                     nv12,
                     frameIndex * 1'000'000ULL / fps,
                     frameIndex == 0))
-                sendEncoded(encoded);
+                writer.Send(encoded);
             nextFrameTime += frameDuration;
             std::this_thread::sleep_until(nextFrameTime);
         }
-        for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
-        if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
-        SendMessage(socket, MakeVideoFrame(
-            nextSequence++,
-            frameId,
-            static_cast<std::uint64_t>(seconds) * 1'000'000ULL,
-            {},
-            false,
-            false,
-            true));
+        for (const auto& encoded : encoder.Drain()) writer.Send(encoded);
+        writer.SendEndOfStream(frameIndex * 1'000'000ULL / fps);
         std::cout
-            << "Encoder demo completed: " << (frameId - 1) << " frames, "
-            << bytesSent << " encoded bytes.\n";
+            << "Encoder demo completed: " << writer.FramesSent() << " frames, "
+            << writer.BytesSent() << " encoded bytes.\n";
     }
 
-    void RunDesktopStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
+    void RunDesktopStream(ProtocolSender& sender, unsigned seconds)
     {
         constexpr std::uint16_t width = 1280;
         constexpr std::uint16_t height = 800;
@@ -826,44 +1165,14 @@ namespace
             << "Desktop capture: primary display -> " << width << 'x' << height << " @ " << fps << " FPS\n"
             << "Media Foundation encoder: " << encoder.Name()
             << (encoder.IsHardware() ? " (hardware)" : " (software fallback)") << '\n';
+        VideoStreamWriter writer(sender, encoder, width, height, fps, bitrate);
 
         const auto frameDuration = std::chrono::nanoseconds(1'000'000'000ULL / fps);
         auto nextFrameTime = std::chrono::steady_clock::now();
-        std::uint64_t frameId = 1;
-        std::uint64_t bytesSent{};
-        bool configSent{};
-        bool firstFrame = true;
-
-        const auto sendEncoded = [&](const tabletdisplay::host::EncodedAccessUnit& encoded)
-        {
-            if (!configSent)
-            {
-                const auto* config = encoder.CodecConfig();
-                if (config == nullptr) throw std::runtime_error("H.264 encoder produced no SPS/PPS");
-                SendMessage(socket, MakeVideoConfig(
-                    nextSequence++, width, height, fps,
-                    config->profileIdc == 0 ? 66 : config->profileIdc,
-                    config->levelIdc == 0 ? 40 : config->levelIdc,
-                    bitrate,
-                    config->annexB));
-                configSent = true;
-            }
-            if (firstFrame && !encoded.keyFrame)
-                throw std::runtime_error("H.264 encoder did not produce an initial IDR");
-            SendMessage(socket, MakeVideoFrame(
-                nextSequence++,
-                frameId++,
-                encoded.presentationTimeUs,
-                encoded.bytes,
-                encoded.keyFrame,
-                firstFrame));
-            bytesSent += encoded.bytes.size();
-            firstFrame = false;
-        };
-
         const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
         std::vector<std::uint8_t> nv12;
-        for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
+        std::uint64_t frameIndex = 0;
+        for (; frameIndex < frameCount && !StopRequested(); ++frameIndex)
         {
             std::this_thread::sleep_until(nextFrameTime);
             const auto frame = capture.Capture();
@@ -871,36 +1180,85 @@ namespace
                 frame.bgra, frame.width, frame.height, frame.stride, nv12);
             const auto ptsUs = frameIndex * 1'000'000ULL / fps;
             for (const auto& encoded : encoder.Encode(nv12, ptsUs, frameIndex == 0))
-                sendEncoded(encoded);
+                writer.Send(encoded);
             nextFrameTime += frameDuration;
         }
-        for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
-        if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
-        SendMessage(socket, MakeVideoFrame(
-            nextSequence++,
-            frameId,
-            static_cast<std::uint64_t>(seconds) * 1'000'000ULL,
-            {},
-            false,
-            false,
-            true));
+        for (const auto& encoded : encoder.Drain()) writer.Send(encoded);
+        writer.SendEndOfStream(frameIndex * 1'000'000ULL / fps);
         std::cout
-            << "Desktop stream completed: " << (frameId - 1) << " frames, "
-            << bytesSent << " encoded bytes.\n";
+            << "Desktop stream completed: " << writer.FramesSent() << " frames, "
+            << writer.BytesSent() << " encoded bytes.\n";
     }
 
-    void RunVirtualDisplayStream(SOCKET socket, std::uint64_t nextSequence, unsigned seconds)
+    [[nodiscard]] bool DecoderAccepts(tabletdisplay::display::Mode mode, const AndroidDisplay& display) noexcept
     {
+        // Decoder limits are reported per axis; compare long and short sides so the
+        // portrait variant of a landscape mode is judged the same way.
+        const auto decoderLong = std::max(display.maxAvcWidth, display.maxAvcHeight);
+        const auto decoderShort = std::min(display.maxAvcWidth, display.maxAvcHeight);
+        return std::max(mode.width, mode.height) <= decoderLong &&
+            std::min(mode.width, mode.height) <= decoderShort;
+    }
+
+    // About 0.13 bit per pixel: 8 Mbit/s for 1280x800 at 60 FPS, which the tablet handles well.
+    [[nodiscard]] std::uint32_t BitrateFor(std::uint32_t width, std::uint32_t height, std::uint32_t fps) noexcept
+    {
+        const auto pixelsPerSecond = static_cast<std::uint64_t>(width) * height * fps;
+        return static_cast<std::uint32_t>(
+            std::clamp<std::uint64_t>(pixelsPerSecond * 13U / 100U, 2'000'000U, 25'000'000U));
+    }
+
+    // seconds == 0 streams until the tray stops the Host or the connection fails.
+    // The virtual monitor uses the tablet resolution divided by resolutionDivisor (1..4).
+    void RunVirtualDisplayStream(
+        SOCKET socket,
+        ProtocolSender& sender,
+        IncrementalDecoder receiveDecoder,
+        const AndroidDisplay& display,
+        unsigned resolutionDivisor,
+        unsigned seconds)
+    {
+        namespace modes = tabletdisplay::display;
+        const auto native = modes::Landscape(display.width, display.height);
+        if (!modes::IsSupportedMode(modes::ScaledMode(native.width, native.height, 1)))
+        {
+            throw std::runtime_error(
+                "The tablet resolution " + std::to_string(native.width) + 'x' +
+                std::to_string(native.height) + " is outside the supported virtual display range");
+        }
+        // A smaller mode keeps the aspect ratio when the tablet decoder cannot play the requested one.
+        auto divisor = resolutionDivisor;
+        auto landscape = modes::ScaledMode(native.width, native.height, divisor);
+        while (divisor <= modes::kMaxResolutionDivisor &&
+            (!modes::IsSupportedMode(landscape) || !DecoderAccepts(landscape, display)))
+        {
+            ++divisor;
+            landscape = modes::ScaledMode(native.width, native.height, divisor);
+        }
+        if (divisor > modes::kMaxResolutionDivisor)
+            throw std::runtime_error("The tablet decoder cannot play any TabletDisplay mode");
+        if (divisor != resolutionDivisor)
+        {
+            std::cout << "The tablet decoder is limited to " << display.maxAvcWidth << 'x'
+                << display.maxAvcHeight << "; using 1/" << divisor << " of the tablet resolution.\n";
+        }
+
         tabletdisplay::host::IddFrameCapture capture;
-        capture.SetMonitorConnected(true);
+        capture.SetMonitorConnected(true, {
+            static_cast<std::uint16_t>(native.width),
+            static_cast<std::uint16_t>(native.height),
+            static_cast<std::uint16_t>(divisor) });
+        ReportProgress();
         const auto orientation = WaitForTabletDisplayOrientation();
         const bool portrait = orientation == DMDO_90 || orientation == DMDO_270;
-        const std::uint16_t width = portrait ? 800 : 1280;
-        const std::uint16_t height = portrait ? 1280 : 800;
-        const std::uint16_t rawWidth = portrait ? height : width;
-        const std::uint16_t rawHeight = portrait ? width : height;
+        const auto rawWidth = static_cast<std::uint16_t>(landscape.width);
+        const auto rawHeight = static_cast<std::uint16_t>(landscape.height);
+        const std::uint16_t width = portrait ? rawHeight : rawWidth;
+        const std::uint16_t height = portrait ? rawWidth : rawHeight;
         constexpr std::uint16_t fps = 60;
-        constexpr std::uint32_t bitrate = 8'000'000;
+        const auto bitrate = BitrateFor(width, height, fps);
+        std::cout << "Tablet " << native.width << 'x' << native.height << ", resolution 1/" << divisor
+            << " -> " << width << 'x' << height << ", " << bitrate / 1'000U << " kbit/s\n";
         ConfigureTabletDisplayMode(width, height, fps);
         tabletdisplay::host::CapturedFrame frame{};
         const auto waitForFrame = [&]()
@@ -918,6 +1276,7 @@ namespace
                 "No IddCx frame is available in the requested TabletDisplay orientation. "
                 "Select 'Extend these displays' in Windows display settings");
         }
+        ReportProgress();
         std::cout << "IddCx raw frame: " << frame.width << 'x' << frame.height << '\n';
         if (frame.width != rawWidth || frame.height != rawHeight)
         {
@@ -961,6 +1320,7 @@ namespace
         {
             sharedTransport = false;
         }
+        ReportProgress();
         std::cout
             << "IddCx capture: virtual display -> " << width << 'x' << height
             << " @ " << fps << " FPS\n"
@@ -970,24 +1330,23 @@ namespace
             << (sharedTransport ? "shared D3D11 texture (zero-copy)" : "CPU BGRA IOCTL fallback")
             << '\n';
 
-        const auto displayBounds = FindTabletDisplayBounds();
         const DWORD receiveTimeoutMs = 250;
         if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
                 reinterpret_cast<const char*>(&receiveTimeoutMs), sizeof(receiveTimeoutMs)) != 0)
             throw std::runtime_error("Cannot configure the touch receiver timeout");
         std::atomic_bool forceKeyFrame{};
         std::atomic_uint64_t receivedTouches{};
+        std::atomic_uint64_t lastReceivedMs{ GetTickCount64() };
         std::atomic_bool primaryButtonDown{};
         [[maybe_unused]] TabletMouseButtonGuard mouseButtonGuard(primaryButtonDown);
         std::mutex receiverFailureMutex;
         std::exception_ptr receiverFailure;
-        std::jthread touchReceiver([&](std::stop_token stopToken)
+        std::jthread receiver([&](std::stop_token stopToken)
         {
             try
             {
-                IncrementalDecoder decoder(kMaxPayloadSize, false);
+                auto displayBounds = FindTabletDisplayBounds();
                 std::array<std::uint8_t, 16 * 1024> buffer{};
-                std::uint64_t expectedSequence = 4;
                 while (!stopToken.stop_requested())
                 {
                     const auto count = recv(socket, reinterpret_cast<char*>(buffer.data()),
@@ -996,18 +1355,18 @@ namespace
                     {
                         if (WSAGetLastError() == WSAETIMEDOUT) continue;
                         if (stopToken.stop_requested()) return;
-                        throw std::runtime_error("Android-to-Windows receive failed");
+                        throw TransportFailure("Android-to-Windows receive failed");
                     }
                     if (count == 0)
                     {
                         if (stopToken.stop_requested()) return;
-                        throw std::runtime_error("Android closed the streaming connection");
+                        throw TransportFailure("Android closed the streaming connection");
                     }
-                    for (const auto& message : decoder.Feed(
+                    // The handshake decoder continues, so sequence numbers stay verified.
+                    for (const auto& message : receiveDecoder.Feed(
                             std::span<const std::uint8_t>(buffer.data(), static_cast<std::size_t>(count))))
                     {
-                        if (message.header.sequence != expectedSequence++)
-                            throw std::runtime_error("Android-to-Windows message sequence gap");
+                        lastReceivedMs = GetTickCount64();
                         const auto type = static_cast<MessageType>(message.header.messageType);
                         if (type == MessageType::Touch)
                         {
@@ -1018,13 +1377,27 @@ namespace
                         {
                             forceKeyFrame = true;
                         }
+                        else if (type == MessageType::Ping)
+                        {
+                            sender.Send([&](std::uint64_t sequence)
+                            {
+                                return MakePong(sequence, message.payload);
+                            });
+                        }
+                        else if (type == MessageType::Pong)
+                        {
+                            // Heartbeat answer; receiving it is all that matters.
+                        }
                         else if (type == MessageType::Error)
                         {
-                            throw std::runtime_error("Android reported a streaming error");
+                            throw PeerReportedFailure(
+                                "Android reported a streaming error: " + ErrorText(message.payload));
                         }
                         else
                         {
-                            throw std::runtime_error("Unexpected Android-to-Windows streaming message");
+                            throw ProtocolFailure(
+                                kErrorUnexpectedMessage,
+                                "Unexpected Android-to-Windows streaming message");
                         }
                     }
                 }
@@ -1044,41 +1417,13 @@ namespace
             if (receiverFailure) std::rethrow_exception(receiverFailure);
         };
 
-        std::uint64_t frameId = 1;
-        std::uint64_t bytesSent{};
-        bool configSent{};
-        bool firstFrame = true;
-        const auto sendEncoded = [&](const tabletdisplay::host::EncodedAccessUnit& encoded)
-        {
-            if (!configSent)
-            {
-                const auto* config = encoder.CodecConfig();
-                if (config == nullptr) throw std::runtime_error("H.264 encoder produced no SPS/PPS");
-                SendMessage(socket, MakeVideoConfig(
-                    nextSequence++, width, height, fps,
-                    config->profileIdc == 0 ? 66 : config->profileIdc,
-                    config->levelIdc == 0 ? 40 : config->levelIdc,
-                    bitrate,
-                    config->annexB));
-                configSent = true;
-            }
-            if (firstFrame && !encoded.keyFrame)
-                throw std::runtime_error("H.264 encoder did not produce an initial IDR");
-            SendMessage(socket, MakeVideoFrame(
-                nextSequence++,
-                frameId++,
-                encoded.presentationTimeUs,
-                encoded.bytes,
-                encoded.keyFrame,
-                firstFrame));
-            bytesSent += encoded.bytes.size();
-            firstFrame = false;
-        };
-
+        VideoStreamWriter writer(sender, encoder, width, height, fps, bitrate);
         const auto frameDuration = std::chrono::nanoseconds(1'000'000'000ULL / fps);
         using Clock = std::chrono::steady_clock;
         const auto streamStarted = Clock::now();
-        const auto frameCount = static_cast<std::uint64_t>(seconds) * fps;
+        const auto frameCount = seconds == 0
+            ? std::numeric_limits<std::uint64_t>::max()
+            : static_cast<std::uint64_t>(seconds) * fps;
 
         struct PreparedFrameSlot
         {
@@ -1093,6 +1438,16 @@ namespace
             bool stop{};
             std::exception_ptr failure;
         } slot;
+        const auto stopProducer = [&]
+        {
+            {
+                std::lock_guard lock(slot.mutex);
+                slot.stop = true;
+                slot.occupied = false;
+            }
+            slot.empty.notify_all();
+            slot.ready.notify_all();
+        };
 
         std::chrono::nanoseconds captureTime{};
         std::chrono::nanoseconds encodingTime{};
@@ -1131,13 +1486,14 @@ namespace
                     }
 
                     const auto producerWorkStarted = Clock::now();
+                    bool newSharedFrame = sharedTransport;
                     if (frameIndex != 0)
                     {
                         const auto captureStarted = Clock::now();
                         if (sharedTransport)
                         {
-                            slot.newSharedFrame = capture.CaptureShared(preparedShared, 0);
-                            if (slot.newSharedFrame &&
+                            newSharedFrame = capture.CaptureShared(preparedShared, 0);
+                            if (newSharedFrame &&
                                 (preparedShared.width != rawWidth ||
                                  preparedShared.height != rawHeight))
                             {
@@ -1155,10 +1511,6 @@ namespace
                         }
                         captureTime += Clock::now() - captureStarted;
                     }
-                    else
-                    {
-                        slot.newSharedFrame = sharedTransport;
-                    }
                     maximumProducerWork = std::max(
                         maximumProducerWork,
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1169,6 +1521,7 @@ namespace
                         if (slot.stop) return;
                         slot.frame = prepared;
                         slot.sharedFrame = preparedShared;
+                        slot.newSharedFrame = newSharedFrame;
                         slot.occupied = true;
                     }
                     slot.ready.notify_one();
@@ -1193,11 +1546,29 @@ namespace
         auto activeSharedGeneration = initialSharedFrame.generation;
         std::uint64_t submittedFrames{};
         bool conversionReported{};
+        bool stopped{};
+        const auto pingToken = RandomNonce();
+        auto lastPingSent = Clock::now();
+        lastReceivedMs = GetTickCount64();
         try
         {
             for (std::uint64_t frameIndex = 0; frameIndex < frameCount; ++frameIndex)
             {
                 checkReceiver();
+                if (StopRequested())
+                {
+                    stopped = true;
+                    break;
+                }
+                // Heartbeat: Android answers each PING with PONG, so silence means it is gone.
+                if (Clock::now() - lastPingSent >= std::chrono::milliseconds(kHeartbeatIntervalMs))
+                {
+                    sender.Send([&](std::uint64_t sequence) { return MakePing(sequence, pingToken); });
+                    lastPingSent = Clock::now();
+                }
+                if (GetTickCount64() - lastReceivedMs.load() > kIdleTimeoutMs)
+                    throw ProtocolFailure(kErrorTimeout, "Android did not answer the heartbeat");
+
                 {
                     std::unique_lock lock(slot.mutex);
                     slot.ready.wait(lock, [&]
@@ -1214,8 +1585,9 @@ namespace
                 const auto consumerWorkStarted = Clock::now();
                 const auto ptsUs = frameIndex * 1'000'000ULL / fps;
                 const auto encodingStarted = Clock::now();
-                const auto requestKeyFrame =
-                    frameIndex == 0 || forceKeyFrame.exchange(false);
+                const auto keyFrameRequested = forceKeyFrame.exchange(false);
+                if (keyFrameRequested) writer.RequestDiscontinuity();
+                const auto requestKeyFrame = frameIndex == 0 || keyFrameRequested;
                 if (sharedTransport && newSharedFrame &&
                     sharedFrame.generation != activeSharedGeneration)
                 {
@@ -1260,7 +1632,7 @@ namespace
                 }
                 const auto sendStarted = Clock::now();
                 for (const auto& encoded : encodedFrames)
-                    sendEncoded(encoded);
+                    writer.Send(encoded);
                 sendTime += Clock::now() - sendStarted;
                 ++submittedFrames;
 
@@ -1279,45 +1651,32 @@ namespace
                 }
                 previousFrameFinished = frameFinished;
             }
+            stopProducer();
             producer.join();
             checkReceiver();
         }
         catch (...)
         {
-            {
-                std::lock_guard lock(slot.mutex);
-                slot.stop = true;
-                slot.occupied = false;
-            }
-            slot.empty.notify_all();
-            slot.ready.notify_all();
+            stopProducer();
             if (producer.joinable()) producer.join();
             throw;
         }
-        if (submittedFrames != frameCount)
+        if (!stopped && submittedFrames != frameCount)
             throw std::runtime_error("The frame preparation pipeline stopped before completing the stream");
 
         const auto streamElapsed = Clock::now() - streamStarted;
-        for (const auto& encoded : encoder.Drain()) sendEncoded(encoded);
-        if (!configSent) throw std::runtime_error("H.264 encoder produced no frames");
-        SendMessage(socket, MakeVideoFrame(
-            nextSequence++,
-            frameId,
-            static_cast<std::uint64_t>(seconds) * 1'000'000ULL,
-            {},
-            false,
-            false,
-            true));
-        touchReceiver.request_stop();
-        touchReceiver.join();
+        for (const auto& encoded : encoder.Drain()) writer.Send(encoded);
+        writer.SendEndOfStream(submittedFrames * 1'000'000ULL / fps);
+        receiver.request_stop();
+        receiver.join();
         checkReceiver();
         std::cout
-            << "Virtual-display stream completed: " << (frameId - 1) << " frames, "
-            << bytesSent << " encoded bytes, " << receivedTouches.load() << " touch events.\n";
-        const auto averageMilliseconds = [frameCount](std::chrono::nanoseconds duration)
+            << "Virtual-display stream completed: " << writer.FramesSent() << " frames, "
+            << writer.BytesSent() << " encoded bytes, " << receivedTouches.load() << " touch events.\n";
+        const auto averageMilliseconds = [submittedFrames](std::chrono::nanoseconds duration)
         {
             return std::chrono::duration<double, std::milli>(duration).count() /
-                static_cast<double>(frameCount);
+                static_cast<double>(std::max<std::uint64_t>(1, submittedFrames));
         };
         std::cout
             << "Pipeline timing: "
@@ -1333,7 +1692,7 @@ namespace
             << " ms; max output interval "
             << std::chrono::duration<double, std::milli>(maximumOutputInterval).count()
             << " ms, delayed intervals " << delayedOutputIntervals << '/'
-            << (frameCount > 0 ? frameCount - 1 : 0) << ".\n";
+            << (submittedFrames > 0 ? submittedFrames - 1 : 0) << ".\n";
     }
 
     void PrintHelp()
@@ -1347,13 +1706,17 @@ namespace
             << "  TabletDisplayHost --encoder-demo [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N] [--reconnect]\n"
-            << "  TabletDisplayHost --version\n";
+            << "                    [--scale 1|2|3|4] [--stop-event NAME]\n"
+            << "  TabletDisplayHost --version\n"
+            << "--seconds 0 streams the virtual display until the stop event is signaled.\n"
+            << "--scale N divides the tablet resolution by N, keeping its aspect ratio (default 1).\n";
     }
 
     int ConnectCommand(
         const std::string& requestedSerial,
         RunMode mode,
-        unsigned streamSeconds)
+        unsigned streamSeconds,
+        unsigned resolutionDivisor = 1)
     {
         const auto adb = FindAdb();
         std::cout << "ADB: " << Narrow(adb.wstring()) << '\n';
@@ -1377,22 +1740,37 @@ namespace
             }
             WinsockSession winsock;
             auto socket = ConnectLoopback();
-            const auto nextSequence = PerformHandshake(socket.get());
-            if (mode == RunMode::Synthetic)
+            auto handshake = PerformHandshake(socket.get());
+            ProtocolSender sender(socket.get(), handshake.nextSequence);
+            try
             {
-                RunSyntheticDemo(socket.get(), nextSequence);
+                if (mode == RunMode::Synthetic)
+                {
+                    RunSyntheticDemo(sender);
+                }
+                else if (mode == RunMode::EncoderDemo)
+                {
+                    RunEncoderDemo(sender, streamSeconds);
+                }
+                else if (mode == RunMode::Desktop)
+                {
+                    RunDesktopStream(sender, streamSeconds);
+                }
+                else if (mode == RunMode::VirtualDisplay)
+                {
+                    RunVirtualDisplayStream(
+                        socket.get(),
+                        sender,
+                        std::move(handshake.decoder),
+                        handshake.display,
+                        resolutionDivisor,
+                        streamSeconds);
+                }
             }
-            else if (mode == RunMode::EncoderDemo)
+            catch (...)
             {
-                RunEncoderDemo(socket.get(), nextSequence, streamSeconds);
-            }
-            else if (mode == RunMode::Desktop)
-            {
-                RunDesktopStream(socket.get(), nextSequence, streamSeconds);
-            }
-            else if (mode == RunMode::VirtualDisplay)
-            {
-                RunVirtualDisplayStream(socket.get(), nextSequence, streamSeconds);
+                SendFatalError(sender, std::current_exception());
+                throw;
             }
             if (createdForward)
             {
@@ -1404,41 +1782,74 @@ namespace
         {
             if (createdForward)
             {
-                (void)RunProcess(adb, selector + L"forward --remove tcp:27183");
+                try
+                {
+                    (void)RunProcess(adb, selector + L"forward --remove tcp:27183");
+                }
+                catch (...)
+                {
+                }
             }
             throw;
         }
         return 0;
     }
 
+    // totalSeconds == 0 keeps reconnecting until the tray signals the stop event.
     int ReconnectingVirtualDisplayCommand(
         const std::string& requestedSerial,
-        unsigned totalSeconds)
+        unsigned totalSeconds,
+        unsigned resolutionDivisor)
     {
         using Clock = std::chrono::steady_clock;
+        const bool unlimited = totalSeconds == 0;
         const auto deadline = Clock::now() + std::chrono::seconds(totalSeconds);
+        ProgressWatchdog watchdog(std::chrono::seconds(30));
         unsigned reconnectCount{};
-        while (Clock::now() < deadline)
+        bool reportedMissingDevice{};
+        while (!StopRequested() && (unlimited || Clock::now() < deadline))
         {
-            const auto remaining = deadline - Clock::now();
-            const auto wholeSeconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
-            const auto attemptSeconds = static_cast<unsigned>(wholeSeconds.count()) +
-                (remaining > wholeSeconds ? 1U : 0U);
+            ReportProgress();
+            unsigned attemptSeconds = 0;
+            if (!unlimited)
+            {
+                const auto remaining = deadline - Clock::now();
+                const auto wholeSeconds = std::chrono::duration_cast<std::chrono::seconds>(remaining);
+                attemptSeconds = std::max(1U, static_cast<unsigned>(wholeSeconds.count()) +
+                    (remaining > wholeSeconds ? 1U : 0U));
+            }
             try
             {
-                ConnectCommand(requestedSerial, RunMode::VirtualDisplay, attemptSeconds);
-                std::cout << "Continuous virtual-display stream completed after "
-                    << reconnectCount << " reconnect(s).\n";
-                return 0;
+                ConnectCommand(requestedSerial, RunMode::VirtualDisplay, attemptSeconds, resolutionDivisor);
+                reportedMissingDevice = false;
+                if (!unlimited && !StopRequested())
+                {
+                    std::cout << "Continuous virtual-display stream completed after "
+                        << reconnectCount << " reconnect(s).\n";
+                    return 0;
+                }
+            }
+            catch (const NoDeviceFailure& exception)
+            {
+                // Waiting for the tablet: poll adb less often and report the state only once.
+                if (!reportedMissingDevice) std::cerr << exception.what() << "; waiting for the tablet.\n";
+                reportedMissingDevice = true;
+                (void)WaitUnlessStopped(std::chrono::seconds(3));
             }
             catch (const std::exception& exception)
             {
-                if (Clock::now() >= deadline) break;
+                reportedMissingDevice = false;
+                if (!unlimited && Clock::now() >= deadline) break;
                 ++reconnectCount;
                 std::cerr << "Virtual-display connection lost: " << exception.what()
                     << ". Reconnect attempt " << reconnectCount << " will start in 1 second.\n";
-                std::this_thread::sleep_until(std::min(deadline, Clock::now() + std::chrono::seconds(1)));
+                (void)WaitUnlessStopped(std::chrono::seconds(1));
             }
+        }
+        if (StopRequested())
+        {
+            std::cout << "Virtual-display stream stopped after " << reconnectCount << " reconnect(s).\n";
+            return 0;
         }
         std::cout << "Continuous virtual-display stream reached its time limit after "
             << reconnectCount << " reconnect(s).\n";
@@ -1476,6 +1887,7 @@ int main(int argc, char* argv[])
             std::string serial;
             unsigned seconds = 10;
             bool reconnect = false;
+            unsigned resolutionDivisor = 1;
             for (int index = 2; index < argc; ++index)
             {
                 const std::string_view option = argv[index];
@@ -1488,16 +1900,33 @@ int main(int argc, char* argv[])
                      command == "--encoder-demo"))
                 {
                     const auto parsed = std::stoul(argv[++index]);
-                    if (parsed == 0 || parsed > 3'600) throw std::runtime_error("--seconds must be in 1..3600");
+                    const bool unlimitedAllowed = command == "--virtual-stream";
+                    if ((parsed == 0 && !unlimitedAllowed) || parsed > 3'600)
+                        throw std::runtime_error("--seconds must be in 1..3600 (0 = unlimited for --virtual-stream)");
                     seconds = parsed;
+                }
+                else if (option == "--scale" && index + 1 < argc && command == "--virtual-stream")
+                {
+                    const auto parsed = std::stoul(argv[++index]);
+                    if (parsed < tabletdisplay::display::kMinResolutionDivisor ||
+                        parsed > tabletdisplay::display::kMaxResolutionDivisor)
+                        throw std::runtime_error("--scale must be 1, 2, 3 or 4");
+                    resolutionDivisor = parsed;
                 }
                 else if (option == "--reconnect" && command == "--virtual-stream")
                 {
                     reconnect = true;
                 }
+                else if (option == "--stop-event" && index + 1 < argc)
+                {
+                    const auto name = Widen(argv[++index]);
+                    g_stopEvent = OpenEventW(SYNCHRONIZE, FALSE, name.c_str());
+                    if (g_stopEvent == nullptr) throw std::runtime_error("Cannot open the stop event");
+                }
                 else
                 {
-                    throw std::runtime_error("Expected [--serial SERIAL] [--seconds N] [--reconnect]");
+                    throw std::runtime_error(
+                        "Expected [--serial SERIAL] [--seconds N] [--reconnect] [--scale N] [--stop-event NAME]");
                 }
             }
             const auto mode = command == "--virtual-stream"
@@ -1507,8 +1936,8 @@ int main(int argc, char* argv[])
                     : (command == "--encoder-demo"
                         ? RunMode::EncoderDemo
                         : (command == "--demo" ? RunMode::Synthetic : RunMode::Connect)));
-            if (reconnect) return ReconnectingVirtualDisplayCommand(serial, seconds);
-            return ConnectCommand(serial, mode, seconds);
+            if (reconnect) return ReconnectingVirtualDisplayCommand(serial, seconds, resolutionDivisor);
+            return ConnectCommand(serial, mode, seconds, resolutionDivisor);
         }
         throw std::runtime_error("Unknown argument");
     }

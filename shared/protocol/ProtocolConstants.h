@@ -17,5 +17,7 @@ namespace tabletdisplay::protocol
     inline constexpr std::uint32_t kMaxPayloadSize = kMaxAccessUnitSize + 32U;
     inline constexpr std::uint32_t kMaxCsdSize = 64U * 1024U;
     inline constexpr std::uint16_t kMaxErrorTextSize = 1024;
+    inline constexpr std::uint16_t kMinVideoDimension = 128;
+    inline constexpr std::uint16_t kMaxVideoDimension = 4096;
     inline constexpr std::uint16_t kProtocolVersion = kVersionMajor;
 }

@@ -74,6 +74,11 @@ namespace tabletdisplay::protocol
     };
 
     [[nodiscard]] bool IsKnownMessageType(std::uint16_t type) noexcept;
+    // Even dimension in 128..4096, as protocol section 5.4 requires for VIDEO_CONFIG.
+    [[nodiscard]] constexpr bool IsValidVideoDimension(std::uint32_t value) noexcept
+    {
+        return value >= kMinVideoDimension && value <= kMaxVideoDimension && value % 2U == 0;
+    }
     [[nodiscard]] std::string_view ProtocolErrorName(ProtocolErrorKind kind) noexcept;
     [[nodiscard]] Header DecodeHeader(
         std::span<const std::uint8_t> bytes,
