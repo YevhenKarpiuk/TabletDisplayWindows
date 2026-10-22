@@ -1227,16 +1227,22 @@ namespace
             std::min(mode.width, mode.height) <= decoderShort;
     }
 
-    // The tray lists every tablet's resolution choices from what its Host last saw.
+    // The tray lists every tablet's resolution choices from what its Host last saw: the panel,
+    // the divisor actually streamed (which may exceed the chosen one when the decoder cannot
+    // play it) and the smallest divisor the tablet decoder accepts.
     void SaveTabletDisplay(
         const std::string& serial,
         std::uint32_t nativeWidth,
         std::uint32_t nativeHeight,
-        bool portrait) noexcept
+        bool portrait,
+        std::uint32_t activeDivisor,
+        std::uint32_t minimumDivisor) noexcept
     {
         const auto key = L"Software\\TabletDisplay\\Devices\\" + Widen(serial);
-        const DWORD values[] = { nativeWidth, nativeHeight, portrait ? 1UL : 0UL };
-        const wchar_t* const names[] = { L"NativeWidth", L"NativeHeight", L"Portrait" };
+        const DWORD values[] = {
+            nativeWidth, nativeHeight, portrait ? 1UL : 0UL, activeDivisor, minimumDivisor };
+        const wchar_t* const names[] = {
+            L"NativeWidth", L"NativeHeight", L"Portrait", L"ActiveDivisor", L"MinimumDivisor" };
         for (std::size_t index = 0; index < std::size(values); ++index)
         {
             (void)RegSetKeyValueW(
@@ -1284,6 +1290,13 @@ namespace
         }
         if (divisor > modes::kMaxResolutionDivisor)
             throw std::runtime_error("The tablet decoder cannot play any TabletDisplay mode");
+        auto minimumDivisor = modes::kMinResolutionDivisor;
+        while (minimumDivisor < divisor)
+        {
+            const auto candidate = modes::ScaledMode(native.width, native.height, minimumDivisor);
+            if (modes::IsSupportedMode(candidate) && DecoderAccepts(candidate, display)) break;
+            ++minimumDivisor;
+        }
         if (divisor != resolutionDivisor)
         {
             std::cout << "The tablet decoder is limited to " << display.maxAvcWidth << 'x'
@@ -1301,7 +1314,7 @@ namespace
         ReportProgress();
         const auto orientation = WaitForTabletDisplayOrientation();
         const bool portrait = orientation == DMDO_90 || orientation == DMDO_270;
-        SaveTabletDisplay(serial, native.width, native.height, portrait);
+        SaveTabletDisplay(serial, native.width, native.height, portrait, divisor, minimumDivisor);
         const auto rawWidth = static_cast<std::uint16_t>(landscape.width);
         const auto rawHeight = static_cast<std::uint16_t>(landscape.height);
         const std::uint16_t width = portrait ? rawHeight : rawWidth;

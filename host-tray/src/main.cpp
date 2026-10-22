@@ -792,16 +792,30 @@ namespace
             if (serial.empty()) continue;
             const auto resolutionMenu = CreatePopupMenu();
             if (!resolutionMenu) continue;
+            // The check mark shows the resolution actually streamed: the Host falls back to a
+            // larger divisor when the tablet decoder cannot play the chosen one, and divisors the
+            // decoder cannot play are disabled.
             const auto selected = DeviceResolutionDivisor(serial);
+            const auto streaming = IsHostRunning(g_hosts[index]);
+            const auto active = DeviceValue(serial, L"ActiveDivisor", 0);
+            const auto shown = streaming && active >= 1 && active <= kMaxResolutionDivisor ? active : selected;
+            const auto minimum = std::clamp<DWORD>(DeviceValue(serial, L"MinimumDivisor", 1), 1, kMaxResolutionDivisor);
             for (DWORD divisor = 1; divisor <= kMaxResolutionDivisor; ++divisor)
             {
                 std::wstring label = (ukrainian ? ukrainianLabels : englishLabels)[divisor - 1];
                 const auto mode = DeviceMode(serial, divisor);
                 if (mode)
                     label += L" (" + std::to_wstring(mode->width) + L"\u00D7" + std::to_wstring(mode->height) + L")";
+                const auto unsupported = divisor < minimum;
+                if (unsupported)
+                {
+                    label += ukrainian
+                        ? L" \u2014 \u043D\u0435 \u043F\u0456\u0434\u0442\u0440\u0438\u043C\u0443\u0454 \u0434\u0435\u043A\u043E\u0434\u0435\u0440"
+                        : L" \u2014 not supported by the decoder";
+                }
                 (void)AppendMenuW(
                     resolutionMenu,
-                    MF_STRING | (divisor == selected ? MF_CHECKED : MF_UNCHECKED),
+                    MF_STRING | (divisor == shown ? MF_CHECKED : MF_UNCHECKED) | (unsupported ? MF_GRAYED : 0),
                     kResolutionCommandBase + index * kResolutionCommandStride + divisor,
                     label.c_str());
             }
@@ -812,8 +826,10 @@ namespace
             const auto name = device != devices.end() && !device->model.empty()
                 ? device->model + L" (" + serial + L")"
                 : serial;
-            const auto title = (ukrainian ? L"\u041c\u043e\u043d\u0456\u0442\u043e\u0440 " : L"Monitor ") +
+            auto title = (ukrainian ? L"\u041c\u043e\u043d\u0456\u0442\u043e\u0440 " : L"Monitor ") +
                 std::to_wstring(index + 1) + L": " + name;
+            if (const auto mode = DeviceMode(serial, shown); mode && streaming)
+                title += L" \u2014 " + std::to_wstring(mode->width) + L"\u00d7" + std::to_wstring(mode->height);
             (void)AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(resolutionMenu), title.c_str());
             listedTablet = true;
         }
