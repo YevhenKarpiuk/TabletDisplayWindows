@@ -10,6 +10,7 @@
 #include "IddFrameCapture.h"
 #include "MediaFoundationH264Encoder.h"
 #include "TabletMonitors.h"
+#include "TouchInjector.h"
 #include "ipc/FrameTransport.h"
 #include "protocol/Protocol.h"
 #include "video/SyntheticH264.h"
@@ -126,6 +127,8 @@ namespace
     // --ignore-decoder-limit streams the chosen resolution even beyond the decoder limits the
     // tablet reports; many decoders play more than they declare.
     bool g_ignoreDecoderLimit{};
+    // --touch-input mouse turns tablet touches into mouse input instead of Windows touch input.
+    bool g_mouseInput{};
     // --wifi-tablet: the paired tablet (32 hex digits) streamed over Wi-Fi instead of adb;
     // --wifi-address overrides the address remembered from discovery.
     std::wstring g_wifiTablet;
@@ -453,9 +456,11 @@ namespace
         std::atomic_bool& primaryButtonDown_;
     };
 
+    // Touches go to Windows touch input when it is available, otherwise to the mouse.
     void InjectTouch(
         std::span<const std::uint8_t> payload,
         DisplayBounds& display,
+        tabletdisplay::host::TouchInjector* touch,
         std::atomic_bool& primaryButtonDown)
     {
         if (ReadLe<std::uint32_t>(payload, 0) != 1 || ReadLe<std::uint32_t>(payload, 4) != 0)
@@ -488,6 +493,15 @@ namespace
             (static_cast<std::int64_t>(normalizedX) * (display.width - 1U) + 32'767) / 65'535;
         const auto pixelY = static_cast<std::int64_t>(display.top) +
             (static_cast<std::int64_t>(normalizedY) * (display.height - 1U) + 32'767) / 65'535;
+        if (touch != nullptr)
+        {
+            touch->Inject(
+                static_cast<tabletdisplay::host::TouchAction>(action),
+                static_cast<long>(pixelX),
+                static_cast<long>(pixelY),
+                ReadLe<std::uint16_t>(payload, 14));
+            return;
+        }
         const auto absoluteX = (pixelX - virtualLeft) * 65'535 / (virtualWidth - 1);
         const auto absoluteY = (pixelY - virtualTop) * 65'535 / (virtualHeight - 1);
 
@@ -1422,6 +1436,19 @@ namespace
         std::atomic_uint64_t lastReceivedMs{ GetTickCount64() };
         std::atomic_bool primaryButtonDown{};
         [[maybe_unused]] TabletMouseButtonGuard mouseButtonGuard(primaryButtonDown);
+        std::unique_ptr<tabletdisplay::host::TouchInjector> touch;
+        if (!g_mouseInput)
+        {
+            try
+            {
+                touch = std::make_unique<tabletdisplay::host::TouchInjector>();
+            }
+            catch (const std::exception& exception)
+            {
+                std::cerr << exception.what() << "; tablet touches move the mouse instead.\n";
+            }
+        }
+        std::cout << "Tablet input: " << (touch ? "Windows touch" : "mouse") << '\n';
         std::mutex receiverFailureMutex;
         std::exception_ptr receiverFailure;
         std::jthread receiver([&](std::stop_token stopToken)
@@ -1456,7 +1483,7 @@ namespace
                         const auto type = static_cast<MessageType>(message.header.messageType);
                         if (type == MessageType::Touch)
                         {
-                            InjectTouch(message.payload, displayBounds, primaryButtonDown);
+                            InjectTouch(message.payload, displayBounds, touch.get(), primaryButtonDown);
                             ++receivedTouches;
                         }
                         else if (type == MessageType::RequestKeyframe)
@@ -1846,7 +1873,7 @@ namespace
             << "  TabletDisplayHost --encoder-demo [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N] [--reconnect]\n"
-            << "                    [--scale 1|2|3|4] [--fps 60|30] [--ignore-decoder-limit]\n"
+            << "                    [--scale 1|2|3|4] [--fps 60|30] [--ignore-decoder-limit] [--touch-input touch|mouse]\n"
             << "                    [--monitor 1|2|3|4] [--port PORT] [--stop-event NAME]\n"
             << "                    [--wifi-tablet ID [--wifi-address HOST]]\n"
             << "  TabletDisplayHost --version\n"
@@ -1854,6 +1881,7 @@ namespace
             << "--scale N divides the tablet resolution by N, keeping its aspect ratio (default 1).\n"
             << "--fps 60|30 sets the virtual display refresh and stream rate (default 60).\n"
             << "--ignore-decoder-limit streams the chosen resolution beyond the decoder limits the tablet reports.\n"
+            << "--touch-input touch (default) injects Windows touch, mouse turns touches into the mouse cursor.\n"
             << "--monitor N streams TabletDisplay monitor N (default: the first free one), so several\n"
             << "  tablets can run one Host each; every Host needs its own --serial and --port.\n"
             << "--port PORT is the local adb forward port (default " << kPort << ").\n"
@@ -2072,6 +2100,8 @@ int main(int argc, char* argv[])
     try
     {
         const std::string_view command = argc > 1 ? argv[1] : "--check";
+        // Touch injection and monitor bounds use physical pixels on every monitor.
+        (void)SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         if (command == "--help")
         {
             PrintHelp();
@@ -2197,6 +2227,13 @@ int main(int argc, char* argv[])
                 else if (option == "--wifi-address" && index + 1 < argc)
                 {
                     g_wifiAddress = Widen(argv[++index]);
+                }
+                else if (option == "--touch-input" && index + 1 < argc && command == "--virtual-stream")
+                {
+                    const std::string_view value = argv[++index];
+                    if (value != "touch" && value != "mouse")
+                        throw std::runtime_error("--touch-input must be touch or mouse");
+                    g_mouseInput = value == "mouse";
                 }
                 else if (option == "--ignore-decoder-limit" && command == "--virtual-stream")
                 {

@@ -54,6 +54,7 @@ namespace
     constexpr UINT kFps60CommandOffset = 5;
     constexpr UINT kFps30CommandOffset = 6;
     constexpr UINT kIgnoreDecoderLimitCommandOffset = 7;
+    constexpr UINT kMouseInputCommandOffset = 8;
     constexpr DWORD kMaxResolutionDivisor = 4;
     // One TabletDisplay monitor, Host process and adb forward port per connected tablet;
     // the driver offers up to four monitors.
@@ -266,6 +267,12 @@ namespace
     bool DeviceIgnoresDecoderLimit(const std::wstring& serial) noexcept
     {
         return DeviceValue(serial, L"IgnoreDecoderLimit", 0) != 0;
+    }
+
+    // Touches become Windows touch input unless the tablet is switched to mouse input.
+    bool DeviceUsesMouseInput(const std::wstring& serial) noexcept
+    {
+        return DeviceValue(serial, L"MouseInput", 0) != 0;
     }
 
     // Tablets without their own choice start with the resolution chosen before per-tablet settings.
@@ -785,6 +792,7 @@ namespace
             L" --scale " + std::to_wstring(DeviceResolutionDivisor(serial)) +
             L" --fps " + std::to_wstring(DeviceFps(serial)) +
             (DeviceIgnoresDecoderLimit(serial) ? L" --ignore-decoder-limit" : L"") +
+            L" --touch-input " + (DeviceUsesMouseInput(serial) ? L"mouse" : L"touch") +
             L" --stop-event " + host.stopEventName;
         std::vector<wchar_t> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back(L'\0');
@@ -977,6 +985,13 @@ namespace
                 ukrainian
                     ? L"\u0406\u0433\u043d\u043e\u0440\u0443\u0432\u0430\u0442\u0438 \u043e\u0431\u043c\u0435\u0436\u0435\u043d\u043d\u044f \u0434\u0435\u043a\u043e\u0434\u0435\u0440\u0430"
                     : L"Ignore the decoder limit");
+            (void)AppendMenuW(
+                resolutionMenu,
+                MF_STRING | (DeviceUsesMouseInput(serial) ? MF_CHECKED : MF_UNCHECKED),
+                commandBase + kMouseInputCommandOffset,
+                ukrainian
+                    ? L"\u0414\u043e\u0442\u0438\u043a\u0438 \u044f\u043a \u043c\u0438\u0448\u0430"
+                    : L"Touches as mouse");
             const auto device = std::find_if(devices.begin(), devices.end(), [&](const AdbDevice& candidate)
             {
                 return candidate.serial == serial;
@@ -1229,6 +1244,10 @@ namespace
                 {
                     changed = SetDeviceValue(
                         serial, L"IgnoreDecoderLimit", DeviceIgnoresDecoderLimit(serial) ? 0 : 1);
+                }
+                else if (offset == kMouseInputCommandOffset)
+                {
+                    changed = SetDeviceValue(serial, L"MouseInput", DeviceUsesMouseInput(serial) ? 0 : 1);
                 }
                 if (changed)
                 {
