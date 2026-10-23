@@ -268,7 +268,7 @@ int main(int argc, char* argv[])
         Check(argc == 2, "usage: TabletDisplayProtocolTests <golden-directory>");
         const std::filesystem::path directory(argv[1]);
         const auto cases = LoadManifest(directory);
-        Check(cases.size() == 14, "unexpected vector count");
+        Check(cases.size() == 15, "unexpected vector count");
 
         for (const auto& vectorCase : cases)
         {
@@ -500,7 +500,7 @@ int main(int argc, char* argv[])
             Check(tamperedRejected, "tampered Wi-Fi record is rejected");
         }
 
-        std::cout << "TabletDisplay protocol: 14 golden vectors, H.264, pixel, frame IPC and Wi-Fi crypto passed\n";
+        std::cout << "TabletDisplay protocol: 15 golden vectors, H.264, pixel, frame IPC and Wi-Fi crypto passed\n";
         return 0;
     }
     catch (const std::exception& exception)

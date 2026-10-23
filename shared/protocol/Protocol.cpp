@@ -144,6 +144,18 @@ namespace tabletdisplay::protocol
                 return;
             }
 
+            // An optional message must stay skippable by peers that do not know it.
+            if (header.messageType == static_cast<std::uint16_t>(MessageType::OrientationPolicy))
+            {
+                if (header.flags != 0)
+                {
+                    throw ProtocolException(
+                        ProtocolErrorKind::InvalidFlags,
+                        "optional message has flags");
+                }
+                return;
+            }
+
             if ((header.flags & HeaderFlag::Critical) == 0)
             {
                 throw ProtocolException(
@@ -188,6 +200,7 @@ namespace tabletdisplay::protocol
         case MessageType::Touch:
         case MessageType::Ping:
         case MessageType::Pong:
+        case MessageType::OrientationPolicy:
         case MessageType::Error:
             return true;
         default:
@@ -268,6 +281,12 @@ namespace tabletdisplay::protocol
 
         switch (static_cast<MessageType>(header.messageType))
         {
+        case MessageType::OrientationPolicy:
+            Require(payload.size() == 8, "ORIENTATION_POLICY size");
+            Require(payload[0] <= 1, "ORIENTATION_POLICY mode");
+            for (std::size_t index = 1; index < 8; ++index)
+                Require(payload[index] == 0, "ORIENTATION_POLICY reserved");
+            break;
         case MessageType::Hello:
         {
             Require(payload.size() == 32, "HELLO size");

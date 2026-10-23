@@ -55,6 +55,7 @@ namespace
     constexpr UINT kFps30CommandOffset = 6;
     constexpr UINT kIgnoreDecoderLimitCommandOffset = 7;
     constexpr UINT kMouseInputCommandOffset = 8;
+    constexpr UINT kLockOrientationCommandOffset = 9;
     constexpr DWORD kMaxResolutionDivisor = 4;
     // One TabletDisplay monitor, Host process and adb forward port per connected tablet;
     // the driver offers up to four monitors.
@@ -267,6 +268,13 @@ namespace
     bool DeviceIgnoresDecoderLimit(const std::wstring& serial) noexcept
     {
         return DeviceValue(serial, L"IgnoreDecoderLimit", 0) != 0;
+    }
+
+    // A locked tablet keeps its orientation from the connection; otherwise it rotates with its
+    // sensor, regardless of its own auto-rotate setting, and the Windows monitor follows it.
+    bool DeviceLocksOrientation(const std::wstring& serial) noexcept
+    {
+        return DeviceValue(serial, L"LockOrientation", 0) != 0;
     }
 
     // Touches become Windows touch input unless the tablet is switched to mouse input.
@@ -793,6 +801,7 @@ namespace
             L" --fps " + std::to_wstring(DeviceFps(serial)) +
             (DeviceIgnoresDecoderLimit(serial) ? L" --ignore-decoder-limit" : L"") +
             L" --touch-input " + (DeviceUsesMouseInput(serial) ? L"mouse" : L"touch") +
+            (DeviceLocksOrientation(serial) ? L" --lock-orientation" : L"") +
             L" --stop-event " + host.stopEventName;
         std::vector<wchar_t> mutableCommand(command.begin(), command.end());
         mutableCommand.push_back(L'\0');
@@ -992,6 +1001,13 @@ namespace
                 ukrainian
                     ? L"\u0414\u043e\u0442\u0438\u043a\u0438 \u044f\u043a \u043c\u0438\u0448\u0430"
                     : L"Touches as mouse");
+            (void)AppendMenuW(
+                resolutionMenu,
+                MF_STRING | (DeviceLocksOrientation(serial) ? MF_CHECKED : MF_UNCHECKED),
+                commandBase + kLockOrientationCommandOffset,
+                ukrainian
+                    ? L"\u0411\u043b\u043e\u043a\u0443\u0432\u0430\u0442\u0438 \u043e\u0440\u0456\u0454\u043d\u0442\u0430\u0446\u0456\u044e"
+                    : L"Lock orientation");
             const auto device = std::find_if(devices.begin(), devices.end(), [&](const AdbDevice& candidate)
             {
                 return candidate.serial == serial;
@@ -1248,6 +1264,11 @@ namespace
                 else if (offset == kMouseInputCommandOffset)
                 {
                     changed = SetDeviceValue(serial, L"MouseInput", DeviceUsesMouseInput(serial) ? 0 : 1);
+                }
+                else if (offset == kLockOrientationCommandOffset)
+                {
+                    changed = SetDeviceValue(
+                        serial, L"LockOrientation", DeviceLocksOrientation(serial) ? 0 : 1);
                 }
                 if (changed)
                 {

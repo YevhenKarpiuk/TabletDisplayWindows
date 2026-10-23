@@ -24,6 +24,8 @@ namespace tabletdisplay::protocol
         Touch = 0x0020,
         Ping = 0x0030,
         Pong = 0x0031,
+        // Optional (not CRITICAL): peers that do not know it skip it.
+        OrientationPolicy = 0x0040,
         Error = 0x00FF,
     };
 

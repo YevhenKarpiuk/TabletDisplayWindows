@@ -50,7 +50,7 @@ Sequence начинается с `1` отдельно для Windows→Android �
 | 2 | `DISCONTINUITY` | decoder должен сбросить зависимое состояние до этого frame |
 | 3 | `END_OF_STREAM` | штатное завершение текущего stream |
 
-Все определённые v1.0 сообщения MUST иметь `CRITICAL`. Биты 1–3 разрешены только у `VIDEO_FRAME`. Неизвестный тип с очищенным `CRITICAL` и нулевыми остальными флагами пропускается после проверки длины и sequence. Неизвестный critical type завершает сеанс.
+Все определённые v1.0 сообщения, кроме необязательного `ORIENTATION_POLICY` (флаги ровно `0`), MUST иметь `CRITICAL`. Биты 1–3 разрешены только у `VIDEO_FRAME`. Неизвестный тип с очищенным `CRITICAL` и нулевыми остальными флагами пропускается после проверки длины и sequence. Неизвестный critical type завершает сеанс.
 
 ## 5. Типы сообщений
 
@@ -65,6 +65,7 @@ Sequence начинается с `1` отдельно для Windows→Android �
 | `0x0020` | `TOUCH` | Android→Windows | 32 |
 | `0x0030` | `PING` | оба | 16 |
 | `0x0031` | `PONG` | оба | 24 |
+| `0x0040` | `ORIENTATION_POLICY` | Windows→Android, необязательное | 8 |
 | `0x00FF` | `ERROR` | оба | 20 + text |
 
 Сообщение известного типа в неверном направлении является `UNEXPECTED_MESSAGE`.
@@ -217,6 +218,19 @@ Reason: `1 FRAME_GAP`, `2 DECODER_ERROR`, `3 SURFACE_RESTORED`, `4 RECONNECT`, `
 Коды: `1 MALFORMED_HEADER`, `2 UNSUPPORTED_VERSION`, `3 UNKNOWN_CRITICAL_TYPE`, `4 PAYLOAD_TOO_LARGE`, `5 INVALID_PAYLOAD`, `6 UNEXPECTED_MESSAGE`, `7 UNSUPPORTED_CODEC`, `8 INTERNAL_ERROR`, `9 TIMEOUT`, `10 SEQUENCE_GAP`.
 
 Текст предназначен только для диагностики, не для ветвления логики. После FATAL отправитель закрывает TCP сразу после записи ERROR. Если заголовок нельзя безопасно разобрать, соединение закрывается без ERROR.
+
+### 5.10 ORIENTATION_POLICY
+
+Необязательное сообщение без `CRITICAL`: реализация, которая его не знает, пропускает его. Windows отправляет его после handshake, до `VIDEO_CONFIG`.
+
+| Offset | Size | Поле |
+|---:|---:|---|
+| 0 | 1 | mode: `0 FOLLOW_SENSOR`, `1 LOCK` |
+| 1 | 7 | reserved |
+
+- `FOLLOW_SENSOR`: Android поворачивает экран по датчику независимо от системного автоповорота. Когда устройство меняет ориентацию (альбомная/портретная) относительно текущего `VIDEO_CONFIG`, Android закрывает сеанс; при reconnect Windows получает новый `DISPLAY_INFO` и поворачивает монитор под ориентацию устройства.
+- `LOCK`: Android фиксирует ориентацию `VIDEO_CONFIG`; Windows при подключении выставляет монитор в ориентацию устройства, а дальше ориентацию задаёт Windows.
+- Без этого сообщения Android ведёт себя как при `LOCK`.
 
 ## 6. State machine
 

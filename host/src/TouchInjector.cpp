@@ -20,6 +20,12 @@ namespace tabletdisplay::host
         constexpr auto kHoldRefreshInterval = std::chrono::milliseconds(100);
         constexpr long kContactRadius = 2;
         constexpr UINT32 kMaxPressure = 1'024;
+        // Windows moves the cursor to a touch for applications that only understand the mouse.
+        // Once the finger lifts the cursor goes back, checked a few times because that move is
+        // asynchronous.
+        constexpr auto kCursorRestoreDelay = std::chrono::milliseconds(30);
+        constexpr int kCursorRestoreChecks = 10;
+        constexpr long kCursorTouchTolerance = 3;
     }
 
     // InjectTouchInput rather than a synthetic pointer device: Windows maps a synthetic touch
@@ -60,6 +66,8 @@ namespace tabletdisplay::host
             case TouchAction::Down:
                 // A DOWN while a contact is held means its UP was lost: lift it first.
                 if (inContact) SendLocked(POINTER_FLAG_UP, lastX, lastY, 0);
+                if (restoreChecksLeft == 0) (void)GetCursorPos(&savedCursor);
+                restoreChecksLeft = 0;
                 inContact = SendLocked(
                     POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT, x, y, contactPressure);
                 break;
@@ -74,6 +82,8 @@ namespace tabletdisplay::host
                 (void)SendLocked(
                     POINTER_FLAG_UP | (action == TouchAction::Cancel ? POINTER_FLAG_CANCELED : 0), x, y, 0);
                 inContact = false;
+                restoreChecksLeft = kCursorRestoreChecks;
+                wake.notify_all();
                 break;
             }
             lastX = x;
@@ -103,8 +113,11 @@ namespace tabletdisplay::host
             std::unique_lock lock(mutex);
             while (!stopToken.stop_requested())
             {
-                (void)wake.wait_for(lock, stopToken, kHoldRefreshInterval, [] { return false; });
+                (void)wake.wait_for(
+                    lock, stopToken, restoreChecksLeft > 0 ? kCursorRestoreDelay : kHoldRefreshInterval,
+                    [] { return false; });
                 if (stopToken.stop_requested()) return;
+                if (restoreChecksLeft > 0 && !inContact) RestoreCursorLocked();
                 if (inContact && std::chrono::steady_clock::now() - lastInjection >= kHoldRefreshInterval)
                 {
                     (void)SendLocked(
@@ -115,12 +128,26 @@ namespace tabletdisplay::host
             }
         }
 
+        // Puts the cursor back where it was before the touch, unless the mouse moved it since.
+        void RestoreCursorLocked()
+        {
+            --restoreChecksLeft;
+            POINT cursor{};
+            if (!GetCursorPos(&cursor)) return;
+            const bool atTouch = labs(cursor.x - lastX) <= kCursorTouchTolerance &&
+                labs(cursor.y - lastY) <= kCursorTouchTolerance;
+            if (atTouch) (void)SetCursorPos(savedCursor.x, savedCursor.y);
+            else if (cursor.x != savedCursor.x || cursor.y != savedCursor.y) restoreChecksLeft = 0;
+        }
+
         std::mutex mutex;
         std::condition_variable_any wake;
         bool inContact{};
         long lastX{};
         long lastY{};
         UINT32 lastPressure{};
+        POINT savedCursor{};
+        int restoreChecksLeft{};
         std::chrono::steady_clock::time_point lastInjection{};
         std::jthread refresher;
     };

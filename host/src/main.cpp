@@ -129,6 +129,11 @@ namespace
     bool g_ignoreDecoderLimit{};
     // --touch-input mouse turns tablet touches into mouse input instead of Windows touch input.
     bool g_mouseInput{};
+    // --lock-orientation keeps the tablet in the orientation it had when it connected;
+    // otherwise it rotates with its sensor and the Windows monitor follows it.
+    bool g_lockOrientation{};
+    // The tablet orientation seen at the previous connection of this Host.
+    std::optional<bool> g_lastTabletPortrait;
     // --wifi-tablet: the paired tablet (32 hex digits) streamed over Wi-Fi instead of adb;
     // --wifi-address overrides the address remembered from discovery.
     std::wstring g_wifiTablet;
@@ -353,6 +358,24 @@ namespace
         auto display = FindTabletDisplayMode();
         if (!display) throw std::runtime_error("TabletDisplay virtual display was not found by Windows");
         return std::move(*display);
+    }
+
+    // Turns the TabletDisplay monitor to landscape or portrait, keeping an already matching
+    // orientation (a portrait monitor may be rotated by 90 or 270 degrees).
+    void SetTabletDisplayPortrait(bool portrait)
+    {
+        auto display = RequireTabletDisplayMode();
+        auto& mode = display.mode;
+        const bool current = mode.dmDisplayOrientation == DMDO_90 || mode.dmDisplayOrientation == DMDO_270;
+        if (current == portrait) return;
+        mode.dmDisplayOrientation = portrait ? DMDO_90 : DMDO_DEFAULT;
+        std::swap(mode.dmPelsWidth, mode.dmPelsHeight);
+        mode.dmFields |= DM_DISPLAYORIENTATION | DM_PELSWIDTH | DM_PELSHEIGHT;
+        if (ChangeDisplaySettingsExW(
+                display.deviceName.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY, nullptr) != DISP_CHANGE_SUCCESSFUL)
+            throw std::runtime_error("Windows could not rotate the TabletDisplay monitor");
+        std::cout << "Windows display orientation: " << (portrait ? "portrait" : "landscape")
+            << ", as on the tablet\n";
     }
 
     void ConfigureTabletDisplayMode(
@@ -748,6 +771,14 @@ namespace
         AppendLe(payload, kHeartbeatIntervalMs);
         AppendLe(payload, kIdleTimeoutMs);
         return MakeMessage(MessageType::Hello, 1, std::move(payload));
+    }
+
+    // Optional message: Android versions that do not know it skip it and keep the orientation locked.
+    [[nodiscard]] Message MakeOrientationPolicy(std::uint64_t sequence, bool lock)
+    {
+        std::vector<std::uint8_t> payload(8, 0);
+        payload[0] = lock ? 1 : 0;
+        return MakeMessage(MessageType::OrientationPolicy, sequence, std::move(payload), 0);
     }
 
     [[nodiscard]] Message MakePing(std::uint64_t sequence, std::uint64_t token)
@@ -1336,6 +1367,8 @@ namespace
                 << display.maxAvcHeight << "; using 1/" << divisor << " of the tablet resolution.\n";
         }
 
+        sender.Send([](std::uint64_t sequence) { return MakeOrientationPolicy(sequence, g_lockOrientation); });
+
         tabletdisplay::host::IddFrameCapture capture;
         capture.SetMonitorConnected(true, {
             static_cast<std::uint16_t>(native.width),
@@ -1345,6 +1378,13 @@ namespace
         g_monitorSlot = capture.MonitorSlot();
         std::cout << "TabletDisplay monitor " << g_monitorSlot + 1 << '\n';
         ReportProgress();
+        // The monitor takes the tablet's orientation. A locked tablet keeps the Windows orientation
+        // the user may have chosen since, until the tablet itself is turned.
+        (void)WaitForTabletDisplayOrientation();
+        const bool tabletPortrait = display.height > display.width;
+        if (!g_lockOrientation || g_lastTabletPortrait != tabletPortrait)
+            SetTabletDisplayPortrait(tabletPortrait);
+        g_lastTabletPortrait = tabletPortrait;
         const auto orientation = WaitForTabletDisplayOrientation();
         const bool portrait = orientation == DMDO_90 || orientation == DMDO_270;
         SaveTabletDisplay(serial, native.width, native.height, portrait, divisor, minimumDivisor, g_streamFps);
@@ -1874,6 +1914,7 @@ namespace
             << "  TabletDisplayHost --stream [--serial SERIAL] [--seconds N]\n"
             << "  TabletDisplayHost --virtual-stream [--serial SERIAL] [--seconds N] [--reconnect]\n"
             << "                    [--scale 1|2|3|4] [--fps 60|30] [--ignore-decoder-limit] [--touch-input touch|mouse]\n"
+            << "                    [--lock-orientation]\n"
             << "                    [--monitor 1|2|3|4] [--port PORT] [--stop-event NAME]\n"
             << "                    [--wifi-tablet ID [--wifi-address HOST]]\n"
             << "  TabletDisplayHost --version\n"
@@ -1882,6 +1923,8 @@ namespace
             << "--fps 60|30 sets the virtual display refresh and stream rate (default 60).\n"
             << "--ignore-decoder-limit streams the chosen resolution beyond the decoder limits the tablet reports.\n"
             << "--touch-input touch (default) injects Windows touch, mouse turns touches into the mouse cursor.\n"
+            << "--lock-orientation keeps the tablet orientation from the connection; by default the tablet\n"
+            << "  rotates with its sensor and the Windows monitor follows it.\n"
             << "--monitor N streams TabletDisplay monitor N (default: the first free one), so several\n"
             << "  tablets can run one Host each; every Host needs its own --serial and --port.\n"
             << "--port PORT is the local adb forward port (default " << kPort << ").\n"
@@ -2234,6 +2277,10 @@ int main(int argc, char* argv[])
                     if (value != "touch" && value != "mouse")
                         throw std::runtime_error("--touch-input must be touch or mouse");
                     g_mouseInput = value == "mouse";
+                }
+                else if (option == "--lock-orientation" && command == "--virtual-stream")
+                {
+                    g_lockOrientation = true;
                 }
                 else if (option == "--ignore-decoder-limit" && command == "--virtual-stream")
                 {
