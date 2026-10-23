@@ -4,8 +4,8 @@
 IDI_APP_ICON ICON "..\\assets\\TabletDisplay.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,3,0,0
+ PRODUCTVERSION 0,3,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -18,11 +18,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "TabletDisplay"
             VALUE "FileDescription", "TabletDisplay portable tray host"
-            VALUE "FileVersion", "0.2.0"
+            VALUE "FileVersion", "0.3.0"
             VALUE "InternalName", "TabletDisplay"
             VALUE "OriginalFilename", "TabletDisplay.exe"
             VALUE "ProductName", "TabletDisplay"
-            VALUE "ProductVersion", "0.2.0"
+            VALUE "ProductVersion", "0.3.0"
         END
     END
     BLOCK "VarFileInfo"
